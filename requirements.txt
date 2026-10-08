@@ -1,0 +1,5 @@
+# HTTP client for fetching data from Socrata SODA API
+requests>=2.31.0
+
+# Environment variable loader from .env file
+python-dotenv>=1.0.0
