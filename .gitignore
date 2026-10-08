@@ -1,0 +1,24 @@
+# Secrets & Environment variables
+.env
+.env.local
+.env.*.local
+
+# Python virtual environments & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & OS generated files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Raw data: keep directories with .gitkeep, ignore raw landed data files
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/*/.gitkeep
