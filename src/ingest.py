@@ -12,6 +12,9 @@ if str(ROOT_DIR) not in sys.path:
 from src.client import SodaClient
 from src.storage import save_raw_json
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 load_dotenv()
 
 
