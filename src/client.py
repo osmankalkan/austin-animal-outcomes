@@ -1,6 +1,7 @@
 """
 Socrata Open Data API (SODA) Client for Austin Animal Center datasets.
-Provides authenticated/anonymous HTTP access with environment configuration.
+Provides authenticated/anonymous HTTP access, error resilience (Section 3.2),
+and pagination ($limit / $offset).
 """
 
 import os
@@ -31,13 +32,20 @@ class SodaRequestError(Exception):
 class SodaClient:
     """Client for retrieving raw data from Socrata SODA API endpoints."""
 
-    def __init__(self):
-        self.app_token = os.getenv("AUSTIN_APP_TOKEN", "").strip()
-        self.timeout = int(os.getenv("REQUEST_TIMEOUT_SECONDS", 30))
-        self.max_retries = int(os.getenv("MAX_RETRIES", 5))
-        self.page_limit = int(os.getenv("PAGE_LIMIT", 1000))
+    def __init__(
+        self,
+        app_token: str = None,
+        timeout: int = None,
+        max_retries: int = None,
+        page_limit: int = None
+    ):
+        self.app_token = (app_token or os.getenv("AUSTIN_APP_TOKEN", "")).strip()
+        self.timeout = int(timeout or os.getenv("REQUEST_TIMEOUT_SECONDS", 30))
+        self.max_retries = int(max_retries or os.getenv("MAX_RETRIES", 5))
+        self.page_limit = int(page_limit or os.getenv("PAGE_LIMIT", 1000))
 
     def _get_headers(self) -> dict:
+        """Constructs headers for SODA API requests."""
         headers = {"Accept": "application/json"}
         if self.app_token and self.app_token != "your_socrata_app_token_here":
             headers["X-App-Token"] = self.app_token
@@ -94,7 +102,7 @@ class SodaClient:
                     logger.error(error_msg)
                     raise SodaRequestError(error_msg)
 
-                # Success
+                # 200 OK: Success
                 response.raise_for_status()
                 return response.json()
 
@@ -110,3 +118,74 @@ class SodaClient:
                 time.sleep(wait_time)
 
         raise SodaRequestError(f"Failed to fetch data from {url} after {self.max_retries} attempts.")
+
+    def get(self, endpoint_url: str, limit: int = None, offset: int = 0, params: dict = None) -> list:
+        """Fetches a single page of records."""
+        req_params = (params.copy() if params else {})
+        req_params["$limit"] = limit or self.page_limit
+        req_params["$offset"] = offset
+        req_params.setdefault("$order", ":id")
+        return self._make_request(endpoint_url, params=req_params)
+
+    def fetch_all(
+        self,
+        endpoint_url: str,
+        params: dict = None,
+        max_records: int = None
+    ) -> list:
+        """
+        Paginates through the entire SODA dataset using $limit and $offset.
+        Stops when an empty list is returned or fewer records than limit are received.
+        """
+        offset = 0
+        all_records = []
+        base_params = params.copy() if params else {}
+
+        logger.info(f"Starting pagination for endpoint: {endpoint_url} (page size: {self.page_limit})")
+
+        while True:
+            page_params = base_params.copy()
+            fetch_count = self.page_limit
+
+            if max_records and (len(all_records) + fetch_count > max_records):
+                fetch_count = max_records - len(all_records)
+
+            page_params["$limit"] = fetch_count
+            page_params["$offset"] = offset
+            page_params.setdefault("$order", ":id")
+
+            records = self._make_request(endpoint_url, params=page_params)
+
+            # Boş yanıt kontrolü (Empty response detection)
+            if not records or len(records) == 0:
+                logger.info("Empty response received. Pagination completed.")
+                break
+
+            all_records.extend(records)
+            logger.info(f"Fetched {len(records)} records (running total: {len(all_records)})...")
+
+            if len(records) < fetch_count:
+                logger.info("Dataset fully consumed (fewer records returned than page limit).")
+                break
+
+            offset += len(records)
+
+            if max_records and len(all_records) >= max_records:
+                logger.info(f"Reached requested limit of {max_records} records.")
+                break
+
+        logger.info(f"Total retrieved records: {len(all_records)}")
+        return all_records
+
+
+if __name__ == "__main__":
+    intakes_url = os.getenv(
+        "INTAKES_API_URL",
+        "https://data.austintexas.gov/resource/pyqf-r2dc.json"
+    )
+    test_client = SodaClient(page_limit=5)
+    print("--- Test: Fetching 10 sample records from Austin Animal Center API ---")
+    data = test_client.fetch_all(intakes_url, max_records=10)
+    print(f"Success! Retrieved {len(data)} records.")
+    if data:
+        print("Sample Record ID:", data[0].get("animal_id"))
