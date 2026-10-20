@@ -90,3 +90,21 @@ join_key: date (joins to Intakes/Outcomes on date part of source_date/outcome_da
 first_retrieved: 2026-10-08T19:00:00Z
 known_issues: Secondary optional join candidate proposed in M0 to examine seasonal and weather correlations with shelter intake surges.
 ```
+
+
+---
+
+## 4. Notes Added at M2 (Schema & Database Load)
+
+These notes record what we learned about the sources while loading them into SQLite (`sql/schema.sql`, `src/load.py`).
+
+```yaml
+first_retrieved_actual: intakes 2026-10-08T19:52:57Z, outcomes 2026-10-08T21:33:39Z (from the landed file names in data/raw/)
+timestamp_timezone: source_date, intake_date and outcome_date are Austin local wall-clock time (America/Chicago) WITHOUT an offset, e.g. 2025-05-04T20:45:00.000. The loader converts them explicitly to ISO 8601 UTC (2025-05-05T01:45:00Z), DST-aware.
+date_of_birth: calendar date sent as midnight timestamp (2023-05-06T00:00:00.000); stored as YYYY-MM-DD, no timezone conversion.
+numeric_as_text: days_in_shelter arrives as a JSON string ("733"); the loader casts it to INTEGER (non-numeric or negative -> NULL, counted).
+booleans: ispreviouslyspayedneutered is a JSON boolean (true/false); stored as INTEGER 0/1.
+personal_data: found_address is a street-level free-text address; only the 5-digit ZIP code is stored in the database (found_zip).
+retrieved_at: taken from the landed raw file name (YYYYMMDDTHHMMSSZ.json); when the same event appears in several snapshots, the most recent retrieved_at wins.
+unresolved_references: about 1,000 outcomes belong to animals admitted before the May 2025 system cutover and have no intake in the live dataset; they are kept in the quarantine table, not dropped.
+```
