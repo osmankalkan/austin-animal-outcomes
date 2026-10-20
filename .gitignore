@@ -22,3 +22,10 @@ Thumbs.db
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/*/.gitkeep
+
+# SQLite database: derived from data/raw by src/load.py, never committed
+data/*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
