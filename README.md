@@ -68,12 +68,16 @@ austin-animal-outcomes/
 ├── .env.example            # Template for environment configuration & API credentials
 ├── requirements.txt        # Exact Python dependencies
 ├── data/
-│   ├── austin_animals.db   # Built by src/load.py (not committed)
+│   ├── austin_animals.db   # Built by src/load.py & src/clean.py (not committed)
+│   ├── mappings/           # M3 committed category mapping CSVs (animal_type, intake_type, outcome_status)
 │   └── raw/                # Landed raw JSON responses (organized by source, timestamped)
 │       ├── intakes/        # Raw intake snapshots
 │       └── outcomes/       # Raw outcome snapshots
+├── notebooks/
+│   └── m3_profile.ipynb    # M3 systematic profiling notebook (committed with outputs)
 ├── sql/
-│   ├── schema.sql          # STRICT SQLite schema (re-runnable)
+│   ├── schema.sql          # M2 STRICT SQLite schema (re-runnable, untouched)
+│   ├── clean_schema.sql    # M3 STRICT cleaned layer & mapping tables (re-runnable)
 │   └── queries/
 │       └── length_of_stay_by_animal_type.sql
 ├── src/
@@ -83,9 +87,13 @@ austin-animal-outcomes/
 │   ├── db.py               # connect() (foreign keys ON) and shared helpers
 │   ├── transform.py        # Type / timestamp validation and normalisation
 │   ├── load.py             # Raw files -> SQLite loader (idempotent, atomic, parameterised)
-│   └── checks.py           # Six schema/loader checks on a temporary database copy
+│   ├── checks.py           # Six M2 schema/loader checks on a temporary database copy
+│   ├── clean_config.py     # M3 named and justified cleaning/validation thresholds
+│   ├── clean.py            # M3 idempotent, atomic cleaning pipeline (leaves M2 untouched)
+│   └── validate.py         # M3 automated data-quality validation suite (PASS / WARN / STOP)
 └── docs/
-    └── sources.md          # Comprehensive Data Source provenance cards
+    ├── sources.md          # Comprehensive Data Source provenance cards
+    └── cleaning_report.md  # M3 Data Cleaning & Quality Report
 ```
 
 ## 6. Data Model
@@ -240,10 +248,22 @@ python src/checks.py    # six checks on a temporary copy: all PASS
 
 The database file is derived and is not committed (`data/*.db` is in `.gitignore`); anyone with the raw files can rebuild it with `python src/load.py`.
 
-## 7. Status
-M2 — schema and load complete.
+## 7. Data Quality
 
-## 8. Team
+Profiling the M2 database (`17,696` animals, `18,428` intakes, `17,299` outcomes) revealed substantial disguised missingness (`2,782` `'Unknown'` sex values, `3,112` `'Unknown'` spay/neuter values, and `266` placeholder/ID name strings), non-random missingness conditioned on species and intake channel (**MAR** in `date_of_birth` where `Wildlife` is `75.6%` missing vs `2.4%` in `Cat`, and **MNAR** in `intake_health_condition` where `83.4%` are unlogged), and four cross-field or cross-row anomalies (`3,071` life-stage vs age conflicts, `109` street house numbers captured as `found_zip` when addresses lacked a postal code, `69` birth dates after intake, `50` secondary outcome rows on multi-exit stays, and `99` non-euthanasia outcomes carrying a `euthanasia_reason`). Our M3 cleaning layer (`animals_clean`, `intakes_clean`, `outcomes_clean`, and `stays_clean_view`) leaves the M2 tables untouched, preserves exact row parity, separates canonical species from `life_stage` via committed CSV mappings in [`data/mappings/`](data/mappings/), flags `692` extreme shelter stays (`> Q3 + 3×IQR` per species) without deleting them, and converts invalid or disguised missing values to `NULL` without imputation alongside explicit `<col>_flag` columns. Full evidence, threshold justifications, mapping tables, and validation outputs are documented in [`docs/cleaning_report.md`](docs/cleaning_report.md).
+
+To build and check everything from a fresh clone with landed raw data in `data/raw/`:
+
+```bash
+python src/load.py
+python src/clean.py
+python src/validate.py
+```
+
+## 8. Status
+M3 — cleaned layer and quality report complete.
+
+## 9. Team
 - Ferdi Derebaşı (Student ID: 230717056) — GitHub: [@Ferdi-krbk](https://github.com/Ferdi-krbk)
 - Irmak Köse (Student ID: 230717027) — GitHub: [@irmak23](https://github.com/irmak23)
 - Osman Kalkan (Student ID: 230717048) — GitHub: [@osmankalkan](https://github.com/osmankalkan)
