@@ -295,9 +295,10 @@ def build_cleaned_layer(con: sqlite3.Connection, mappings: dict) -> dict:
         # 1b. date_of_birth rules (Order: missing -> future -> after first intake -> ok)
         first_ia = first_intake_by_animal.get(ak)
         first_ia_date = first_ia[:10] if first_ia else None
+        effective_max_date = max(MAX_VALID_DATE, ret_at[:10]) if ret_at else MAX_VALID_DATE
         if dob_raw is None:
             dob_clean, dob_flag = None, "missing_not_recorded"
-        elif dob_raw > MAX_VALID_DATE:
+        elif dob_raw > effective_max_date:
             dob_clean, dob_flag = None, "invalid_future_date"
         elif first_ia_date and dob_raw > first_ia_date:
             dob_clean, dob_flag = None, "invalid_after_intake"

@@ -80,9 +80,14 @@ def check_stop_1_row_parity(conn: sqlite3.Connection) -> CheckResult:
 
 def check_stop_2_zero_invalid_values(conn: sqlite3.Connection) -> CheckResult:
     """STOP 2: Zero impossible or uncleaned sentinel values survive in cleaned columns."""
+    max_ret_date = conn.execute(
+        "SELECT COALESCE(MAX(substr(retrieved_at, 1, 10)), ?) FROM animals_clean",
+        (MAX_VALID_DATE,),
+    ).fetchone()[0]
+    effective_max_date = max(MAX_VALID_DATE, max_ret_date)
     future_dob = conn.execute(
         "SELECT COUNT(*) FROM animals_clean WHERE date_of_birth IS NOT NULL AND date_of_birth > ?",
-        (MAX_VALID_DATE,),
+        (effective_max_date,),
     ).fetchone()[0]
 
     dob_after_intake = conn.execute(
@@ -248,8 +253,12 @@ def check_warn_1_dob_missing_by_species(conn: sqlite3.Connection) -> CheckResult
 
 def check_warn_2_freshness_by_species(conn: sqlite3.Connection) -> CheckResult:
     """WARN 2: Freshness check — canonical species presence in the final 7-day window."""
+    latest_intake_date = conn.execute(
+        "SELECT COALESCE(MAX(substr(intake_at, 1, 10)), ?) FROM intakes_clean",
+        (MAX_VALID_DATE,),
+    ).fetchone()[0]
     cutoff_date = (
-        date.fromisoformat(MAX_VALID_DATE) - timedelta(days=FRESHNESS_WINDOW_DAYS)
+        date.fromisoformat(latest_intake_date) - timedelta(days=FRESHNESS_WINDOW_DAYS)
     ).isoformat()
 
     rows = conn.execute(

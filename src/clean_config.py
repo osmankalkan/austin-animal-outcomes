@@ -17,7 +17,8 @@ JUVENILE_CONFLICT_AGE_DAYS = 365
 # Youngest age (days) at which a Cat/Dog raw label conflicts with a neonate/juvenile age (< 8 weeks).
 ADULT_LABEL_MIN_AGE_DAYS = 56
 
-# 2. Maximum plausible calendar date for date_of_birth (snapshot retrieval date).
+# 2. Baseline snapshot retrieval date floor for date_of_birth validation;
+# clean.py and validate.py use max(MAX_VALID_DATE, retrieved_at[:10]) per record/snapshot.
 MAX_VALID_DATE = "2026-10-08"
 
 # 3. Robust outlier fence multiplier on length of stay (Q3 + IQR_FENCE_MULTIPLIER * IQR, per species).
