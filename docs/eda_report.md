@@ -2,37 +2,72 @@
 
 ## 1. Summary
 
-We asked how an animal's canonical species, life stage (`juvenile` vs. `adult`), intake channel, and reproductive status relate to shelter length of stay (`length_of_stay_days`) and live adoption probability (`outcome_status = 'Adopted'`) across `17,238` valid completed stays at the Austin Animal Center. Exploration shows that typical stay duration is governed by a right-skewed multi-stage distribution (`Cat` median `7.30` days, `IQR = 21.45`d; `Dog` median `9.19` days, `IQR = 27.19`d), where group rankings reverse depending on whether we measure the typical arrival via the median (`Small Mammal` longest at `14.12`d, `Wildlife` shortest at `3.95`d) or long-term kennel capacity burden via the 95th percentile (`Wildlife` `171.7`d and `Dog` `124.7`d longest). Most importantly, comparing pooled `Dog` versus `Cat` adoption rates (`51.6%` vs. `52.1%`, difference `-0.52` percentage points) masks a strong **Simpson's paradox** driven by group composition: `60.1%` of Cat stays are high-adoption juveniles (`<= 180` days old) and `40.4%` enter through the `Community Program` trap-neuter-return pathway, whereas within **Adult stays (`> 180` days)** Dogs achieve a `+5.41` percentage point higher live adoption rate than Cats (`49.1%` vs. `43.7%`, 95% daily-cohort cluster bootstrap CI `[+2.88, +8.03]`) while staying `+3.28` days longer at the median (`10.26`d vs. `6.98`d). Among adopted companion animals, age at intake exhibits a strong negative rank correlation with length of stay in juvenile cats (Spearman $\rho = -0.46$, driven by unweaned neonates `< 42` days waiting in foster care until reaching the 8-week surgical spay/neuter threshold) that flattens in adults and flips pooled Pearson correlation positive ($r = +0.08$) due to long-stay adult dogs. We are confident in the compositional and mechanical drivers within our 17-month observation window, but seasonal conclusions remain exploratory because a multi-year baseline and resolution of the `1,179+` right-censored open stays could shift tail quantiles in late-summer cohorts. **M3 issues fixed since the M3 tag:** During Section 2.5 time-edge checks, we identified Issue `I-13` (a static `MAX_VALID_DATE = '2026-10-08'` ceiling in `src/clean_config.py` that flagged valid late-October neonates as `invalid_future_date` when newer snapshots were loaded) and fixed `src/clean.py`, `src/validate.py`, and `docs/cleaning_report.md` to anchor future-date validation dynamically to `max(MAX_VALID_DATE, retrieved_at[:10])` and freshness checks to `MAX(substr(intake_at, 1, 10))`.
+We examined how canonical species, life stage (`juvenile` vs. `adult`), intake channel, and sterilization status relate to shelter length of stay (`length_of_stay_days`) and live adoption rate (`outcome_status = 'Adopted'`) across `17,238` valid completed stays at the Austin Animal Center. Length of stay is strongly right-skewed (`Cat` median `7.30`d, `IQR 21.45`d; `Dog` median `9.19`d, `IQR 27.19`d), causing species rankings to invert between typical median stays (`Small Mammal` #1 at `14.12`d vs. `Wildlife` #6 at `3.95`d) and long-tail 95th-percentile stays (`Wildlife` #1 at `171.7`d; `Dog` #2 at `124.7`d). Crucially, pooled `Dog` vs. `Cat` live adoption parity (`51.6%` vs. `52.1%`, diff `-0.52` pp) masks **Simpson's paradox**: because `60.0%` of Cats are high-adoption juveniles and `40.4%` enter via `Community Program` TNR, stratifying by life stage reveals **Adult Dogs beat Adult Cats by `+5.41` percentage points** (`49.1%` vs. `43.7%`, 95% daily-cohort cluster CI `[+2.88, +8.03]`) while staying `+3.28` days longer at the median. Among adopted pets, neonate foster care under 8 weeks drives a steep negative age-vs-stay correlation in juvenile cats (Spearman $\rho = -0.46$) that flattens in adults and flips pooled Pearson $r$ positive ($r = +0.07$). Seasonal findings remain exploratory across this 17-month window. **M3 issue fixed since `m3` tag:** Section 2.5 exploration surfaced Issue `I-13` (static `MAX_VALID_DATE = '2026-10-08'`), fixed in `src/clean.py`, `src/validate.py`, and `docs/cleaning_report.md`.
 
 ---
 
 ## 2. Raw versus cleaned
 
-To quantify how Milestone M3 cleaning changed the headline numbers behind our project question, we executed both the raw M2 aggregation (`outcomes` joined to `animals`, unfiltered) and the M3 cleaned aggregation (`stays_clean_view` filtered to valid primary stays `days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'`). Both queries are stored in [`sql/queries/m4_raw_vs_cleaned_key_metrics.sql`](../sql/queries/m4_raw_vs_cleaned_key_metrics.sql):
+We compared unfiltered M2 raw tables against M3 `stays_clean_view` (`days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'`). Both queries live in [`sql/queries/m4_raw_vs_cleaned_key_metrics.sql`](../sql/queries/m4_raw_vs_cleaned_key_metrics.sql):
 
 ```sql
--- Query 1: M2 Raw tables (unfiltered outcomes joined to animals)
-SELECT
-    a.animal_type AS raw_species,
-    COUNT(*) AS n_completed_stays,
-    ROUND(AVG(julianday(o.outcome_at) - julianday(o.intake_at)), 2) AS mean_los_days,
-    ROUND(100.0 * AVG(CASE WHEN o.outcome_status = 'Adopted' THEN 1.0 ELSE 0.0 END), 2) AS adopted_exact_pct,
-    ROUND(100.0 * AVG(CASE WHEN o.outcome_status LIKE 'Adopted%' THEN 1.0 ELSE 0.0 END), 2) AS adopted_like_pct
-FROM outcomes AS o
-JOIN animals  AS a ON a.animal_key = o.animal_key
-GROUP BY a.animal_type;
+-- =====================================================================
+-- M4 Section 2.1 & 2.2: Raw (M2) vs Cleaned (M3) Key Project Numbers
+-- Question: How do length of stay (days) and live adoption rate (%)
+--           compare between the raw M2 tables and the M3 cleaned layer?
+-- Result grain: One row per (layer, animal_group).
+-- Flag filter on M3 layer:
+--   days_in_shelter_flag IN ('ok', 'unusual_high_stay')
+--   AND stay_sequence_flag = 'ok'
+-- =====================================================================
 
--- Query 2: M3 Cleaned layer (stays_clean_view with reported flag filter)
+WITH raw_stays AS (
+    SELECT
+        '1_M2_Raw' AS layer,
+        CASE
+            WHEN a.animal_type IN ('Cat', 'Dog', 'Kitten', 'Puppy', 'Mammal') THEN a.animal_type
+            ELSE 'Other_Raw'
+        END AS group_label,
+        CAST(o.days_in_shelter AS REAL) AS stay_days_int,
+        (julianday(o.outcome_at) - julianday(o.intake_at)) AS stay_days_exact,
+        CASE WHEN o.outcome_status = 'Adopted' THEN 1.0 ELSE 0.0 END AS is_adopted_exact,
+        CASE WHEN o.outcome_status LIKE 'Adopted%' THEN 1.0 ELSE 0.0 END AS is_adopted_any
+    FROM outcomes AS o
+    JOIN animals  AS a ON a.animal_key = o.animal_key
+),
+clean_stays AS (
+    SELECT
+        '2_M3_Cleaned' AS layer,
+        s.animal_type AS group_label,
+        CAST(s.days_in_shelter AS REAL) AS stay_days_int,
+        s.length_of_stay_days AS stay_days_exact,
+        CASE WHEN s.outcome_status = 'Adopted' THEN 1.0 ELSE 0.0 END AS is_adopted_exact,
+        CASE WHEN s.outcome_status = 'Adopted' THEN 1.0 ELSE 0.0 END AS is_adopted_any
+    FROM stays_clean_view AS s
+    WHERE s.outcome_at IS NOT NULL
+      AND s.days_in_shelter_flag IN ('ok', 'unusual_high_stay')
+      AND s.stay_sequence_flag = 'ok'
+),
+combined AS (
+    SELECT * FROM raw_stays
+    UNION ALL
+    SELECT layer, 'ALL_STAYS' AS group_label, stay_days_int, stay_days_exact, is_adopted_exact, is_adopted_any FROM raw_stays
+    UNION ALL
+    SELECT * FROM clean_stays
+    UNION ALL
+    SELECT layer, 'ALL_STAYS' AS group_label, stay_days_int, stay_days_exact, is_adopted_exact, is_adopted_any FROM clean_stays
+)
 SELECT
-    s.animal_type AS clean_species,
+    layer,
+    group_label,
     COUNT(*) AS n_completed_stays,
-    ROUND(AVG(s.length_of_stay_days), 2) AS mean_los_days,
-    ROUND(100.0 * AVG(CASE WHEN s.outcome_status = 'Adopted' THEN 1.0 ELSE 0.0 END), 2) AS adopted_canonical_pct
-FROM stays_clean_view AS s
-WHERE s.outcome_at IS NOT NULL
-  AND s.days_in_shelter_flag IN ('ok', 'unusual_high_stay')
-  AND s.stay_sequence_flag = 'ok'
-GROUP BY s.animal_type;
+    ROUND(AVG(stay_days_int), 2) AS mean_days_integer,
+    ROUND(AVG(stay_days_exact), 2) AS mean_los_days,
+    ROUND(100.0 * AVG(is_adopted_exact), 2) AS adopted_exact_pct,
+    ROUND(100.0 * AVG(is_adopted_any), 2) AS adopted_canonical_pct
+FROM combined
+GROUP BY layer, group_label
+ORDER BY layer, n_completed_stays DESC;
 ```
 
 | cohort | layer | n | median_los_d | iqr_los_d | mean_los_d | p90_los_d | p95_los_d | adopted_exact_pct | adopted_all_subtypes_pct |
@@ -46,7 +81,7 @@ GROUP BY s.animal_type;
 | M2 Raw — 'Puppy' (separate raw type) | M2 Raw | 311 | 5.04 | 5.93 | 8.91 | 19.22 | 28.62 | 32.8 | 32.8 |
 | M3 Cleaned — Canonical 'Dog' (Adult + Juvenile) | M3 Cleaned | 6281 | 9.19 | 27.19 | 28.74 | 77.22 | 124.7 | 51.63 | 51.63 |
 
-**Explanation of differences:** Across all completed stays, matching exact `outcome_status = 'Adopted'` on M2 raw tables yields an adoption share of only `45.11%` (`n = 17,299`), whereas the M3 cleaned layer reports `49.73%` (`n = 17,238`) because M3 maps six operational adoption subtypes (`'Adopted Altered'`, `'Adopted Offsite(Altered)'`, `'Adopted Unaltered'`, `'Adopted Offsite'`, `'Adopted Offsite(Unaltered)'`, and `'Adopted to Finder'`) into canonical `'Adopted'` while removing secondary duplicate exit rows (`duplicate_exit_for_stay`), negative-duration timestamps (`invalid_outcome_before_intake`), and sequence overlaps (`stay_sequence_flag != 'ok'`). At the species level, raw M2 separated `'Kitten'` (`n = 1,612`, mean stay `9.35`d, exact adoption `24.26%` because most kittens exit via partner rescue transfers or altered adoption subtypes) from `'Cat'` (`n = 8,424`, mean stay `20.86`d). Merging `'Kitten'` and `'Puppy'` into canonical `'Cat'` (`n = 10,011`, median `7.30`d, mean `19.04`d) and `'Dog'` (`n = 6,281`, median `9.19`d, mean `28.74`d) while tracking `life_stage` separately prevents taxonomic dilution and reveals the true species and age baselines.
+**Why numbers differ:** On raw M2 rows (`n = 17,299`), exact `outcome_status = 'Adopted'` captures only `45.11%` adoptions, whereas M3 reports `49.73%` (`n = 17,238`) by consolidating six adoption subtypes (`Adopted Altered`, `Adopted Offsite`, etc.) while filtering `50` duplicate exit rows, `1` negative stays, and `10` sequence errors. Merging raw `Kitten` (`n = 1,612`) and `Puppy` (`n = 311`) into canonical `Cat` and `Dog` prevents species dilution and separates age from taxonomy via `life_stage`.
 
 ![Raw vs Cleaned Impact and Ranking Reversal](../figures/fig1_raw_vs_cleaned_impact.png)
 
@@ -54,9 +89,9 @@ GROUP BY s.animal_type;
 
 ## 3. The question and its summary
 
-**Project Question:** *How do an animal's canonical species, life stage (`juvenile` vs. `adult`), intake channel, and reproductive status relate to how long it stays at the Austin Animal Center (`length_of_stay_days`) and whether its stay ends in live adoption (`outcome_status = 'Adopted'`)?*
+**Project Question:** *How do canonical species, life stage (`juvenile` vs. `adult`), intake channel, and sterilization status relate to length of stay (`length_of_stay_days`) and live adoption (`outcome_status = 'Adopted'`)?*
 
-**Chosen Summary and Justification:** For shelter length of stay (`length_of_stay_days`), we report the **median (`p50`) paired with the interquartile range (`IQR = Q3 - Q1`)** as our primary location-and-spread summary, supplemented by the **95th percentile (`p95`)** for tail capacity and the **live adoption share (%)** for exit disposition. As established in Lecture 1.3, the arithmetic mean is an unrepresentative summary of a typical animal's stay when the distribution is bounded below at zero (`0.0` days) and possesses a heavy right tail stretching to `484` days: a small fraction (~`3.9%`–`4.3%`) of animals held for medical rehabilitation, ringworm quarantine, or cruelty-case court holds pulls the mean to more than double or triple the median (`Cat` mean `19.04`d vs. median `7.30`d; `Dog` mean `28.74`d vs. median `9.19`d).
+**Summary Choice & Justification:** Because shelter stays start at `0` days and stretch to `484` days, we pair the **median (`p50`) and IQR** (typical stay) with **`p95`** (long-stay kennel burden) and **adoption share (%)**. The mean exceeds `2–3x` the median (`Cat` mean `19.04`d vs. median `7.30`d; `Dog` `28.74`d vs. `9.19`d) due to medical, ringworm, and court holds.
 
 | animal_type | n | passes_coverage_rule | median_d | iqr_d | mean_d | sd_d | p90_d | p95_d | share_gt_14d_pct | share_gt_30d_pct | adoption_rate_pct | rank_by_median | rank_by_mean | rank_by_p95 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -69,9 +104,7 @@ GROUP BY s.animal_type;
 | Other | 6 | False | 5.45 | 2.58 | 7.88 | 5.4 | 13.32 | 15.97 | 16.7 | 0.0 | 83.3 | nan | nan | nan |
 | Livestock | 4 | False | 5.17 | 5.1 | 8.46 | 7.23 | 15.29 | 17.26 | 25.0 | 0.0 | 25.0 | nan | nan | nan |
 
-**Comparison with Alternative Summaries (Ranking Reversal Finding):** Computing the arithmetic mean, 90th percentile (`p90`), 95th percentile (`p95`), and share of stays exceeding 30 days (`share_gt_30d_pct`) on the exact same variable demonstrates that **different summaries do not rank the species groups the same way** (Figure 1, Panel B):
-- **By the Median (`rank_by_median`):** Among the 6 species meeting our coverage rule (`n >= 30`), `Small Mammal` ranks **#1 longest** (`14.12` days, `n = 140`), followed by `Dog` (`#2`, `9.19`d, `n = 6,281`), `Cat` (`#3`, `7.30`d, `n = 10,011`), `Reptile` (`#4`, `n = 34`), `Bird` (`#5`, `n = 77`), and `Wildlife` ranks **#6 shortest** (`3.95`d, `n = 685`). This ranking answers the operational question: *"How long does a typical arrival wait before exiting the shelter?"*
-- **By the Mean (`rank_by_mean`) and 95th Percentile (`rank_by_p95`):** The ranking **completely inverts** for `Wildlife` and `Small Mammal`! `Wildlife` jumps from **#6 (shortest median, `3.95`d)** to **#1 longest by both mean (`31.75`d) and 95th percentile (`171.72`d)**, and `Dog` rises to **#2 (`mean = 28.74`d, `p95 = 124.70`d)**, while `Small Mammal` drops to `#3`/`#4` (`p95 = 74.42`d). Why? While over half of wildlife arrivals exit within 0–3 days via immediate transfer to wildlife rehabilitators or humane euthanasia for rabies/trauma, a distinct sub-cohort of overwintering bats and rehabilitating raccoons stays `120–340` days. Thus, the median answers what happens to the *typical individual*, whereas `p95` and the mean answer *"Which group generates the heaviest long-tail residency load on shelter cages and foster homes?"*
+**Ranking Reversal:** Different summaries answer different questions (Figure 1B). By **median stay**, `Small Mammal` ranks #1 longest (`14.12`d), followed by `Dog` (`9.19`d), `Cat` (`7.30`d), `Reptile` (`6.20`d), `Bird` (`5.80`d), and `Wildlife` #6 shortest (`3.95`d). By **mean and `p95`**, `Wildlife` flips from #6 to **#1 longest (`mean 31.75`d, `p95 171.7`d)** and `Dog` reaches **#2 (`p95 124.7`d)**. Half of wildlife exits happen within 4 days, while overwintering bats and rehab cases stretch past 170 days.
 
 ---
 
@@ -79,7 +112,7 @@ GROUP BY s.animal_type;
 
 ### 4.1 Distributional Shape (`length_of_stay_days`)
 
-Before comparing groups, we visualised `length_of_stay_days` in two ways that do not share the same structural weakness (Figure 2): (1) a linear-scale **histogram** across `0–90` days using a justified **`2-day` natural bin width**, and (2) a **log-scale Empirical Cumulative Distribution Function (`ECDF` on `log(1 + days)`)** across all `17,238` completed stays and the 5 primary species/life-stage cohorts. We tested three candidate natural bin widths (`1-day`, `2-day`, and `7-day`) before selecting `2-day` bins:
+We inspected `length_of_stay_days` using two complementary views (Figure 2): a `0–90`d histogram and a `log1p(days)` ECDF across all `17,238` completed stays. Testing candidate bin widths shows why `2-day` bins work best:
 
 | bin_width_days | n_bins_0_to_90d | primary_mode_bin | primary_mode_count | secondary_mode_bin | empty_bin_pct | assessment |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -87,17 +120,16 @@ Before comparing groups, we visualised `length_of_stay_days` in two ways that do
 | 2.0 | 45 | [0d, 2d) | 3048 | [4d, 6d) | 0.0 | 2-day (chosen: resolves day 0-2 intake triage & day 4 stray-hold peak cleanly) |
 | 7.0 | 13 | [0d, 7d) | 7830 | [7d, 14d) | 0.0 | 7-day (weekly bins; over-smooths and hides the 4-day mandatory stray hold) |
 
-A `1-day` bin width introduces artificial sawtooth oscillation caused by weekday/weekend administrative discharge batching, while a `7-day` weekly bin width over-smooths the early stay distribution and obliterates the sharp operational spike at **Day 4** (`[4d, 6d)`), when the City of Austin's mandatory 72–96 hour stray hold expires and animals become eligible for adoption, owner reclaim, or rescue transfer. In words, the distribution of `length_of_stay_days` is **strongly right-skewed, multi-modal (shouldered), bounded at zero, and heavy-tailed**:
-- **Primary mode (`0–2` days):** Same-day and next-day exits driven by wildlife transfers/euthanasia, owner redemptions, and community cat return-to-habitat (`Return to Habitat`).
-- **Secondary operational peak (`4–8` days):** Companion animals (`Cat — Adult` median `6.9`d; `Dog — Adult` median `10.1`d) clearing mandatory stray hold and surgical alteration.
-- **Broad juvenile foster shoulder (`14–60` days):** Visible on the ECDF as a rightward separation of `Cat — Juvenile` (`p90 = 56.2`d) and `Dog — Juvenile` (`p90 = 55.2`d) relative to `Cat — Adult` (`p90 = 39.2`d), reflecting unweaned litters placed in foster homes until they reach surgical weight.
-- **Extreme right tail (`90–484` days):** Concentrated in `Dog — Adult` (`p90 = 93.8`d, max `484`d) and long-term `Wildlife` rehab cases, confirming why a single Gaussian summary (`mean ± SD`) distorts group comparisons.
+Daily `1-day` bins create weekday/weekend discharge sawtooth noise, while `7-day` weekly bins erase the operational **Day-4 mandatory stray hold peak** (`[4d, 6d)`). Across groups, stay duration is **zero-bounded, multi-modal, and heavily right-skewed**:
+- **Day `0–2` triage mode:** Immediate wildlife outcomes, owner reclaims, and community cat TNR returns.
+- **Day `4–8` clearance peak:** Adults (`Cat` median `6.98`d; `Dog` median `10.26`d) exiting after stray holds and spay/neuter.
+- **Foster shoulder (`14–60`d) & tail (`90–484`d):** Juvenile `Cat` (`p90 56.3`d) and `Dog` (`p90 55.3`d) outlast adult cats (`p90 39.2`d) while waiting in foster care; adult dogs drive the longest tail (`p90 92.2`d, max `484`d).
 
 ![Shape of Length of Stay — 2-Day Histogram and Log-Scale ECDF](../figures/fig2_los_shape_hist_ecdf.png)
 
 ### 4.2 Coverage Table and Coverage Rules
 
-To verify what each group's numbers are made of, we tabulated total valid-sequence intakes, completed stays, right-censored open stays (`outcome_at IS NULL`), and attribute completeness (`date_of_birth`, `sex`, `found_zip`, and `intake_health`) across every `(animal_type, life_stage)` stratum ([`sql/queries/m4_coverage_by_species_and_month.sql`](../sql/queries/m4_coverage_by_species_and_month.sql)):
+We audited intake counts, closed-stay completion, and field missingness across `(animal_type, life_stage)` and local months ([`sql/queries/m4_coverage_by_species_and_month.sql`](../sql/queries/m4_coverage_by_species_and_month.sql)):
 
 | animal_type | life_stage | n_intakes | n_completed_stays | n_open_stays | completion_rate_pct | dob_coverage_pct | sex_coverage_pct | zip_coverage_pct | health_logged_pct | n_unusual_high_stay |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -121,9 +153,7 @@ To verify what each group's numbers are made of, we tabulated total valid-sequen
 | Livestock | adult | 2 | 1 | 1 | 50.0 | 100.0 | 100.0 | 100.0 | 0.0 | 0 |
 | Other | adult | 1 | 1 | 0 | 100.0 | 100.0 | 0.0 | 100.0 | 0.0 | 0 |
 
-**Thin Entities and Periods Identified:**
-1. **Thin taxonomic entities:** `Other` (`n = 6` completed stays) and `Livestock` (`n = 4` completed stays) have far too few observations for reliable quantile estimation. Furthermore, `date_of_birth` coverage is high in companion animals (`Cat` `> 97%`, `Dog` `> 97%`) but severely thin in `Wildlife` (`24.4%`–`24.6%` DOB coverage), `Bird` (`27.6%`–`33.3%`), and `Reptile` (`34.8%`–`36.4%`), where `life_stage` is predominantly `'unknown'`. Finally, `intake_health` is logged in only `16.1%`–`16.6%` of intakes (`MNAR`, preferentially recorded when animals arrive injured or sick).
-2. **Thin / right-censored time periods:** Evaluating monthly intake cohorts in Austin local time (`America/Chicago`) across all `18` calendar months shows that `15` of `18` months meet both completeness criteria, while `3` edge months (`2026-08, 2026-09, 2026-10`) fail:
+**Thin Entities & Edge Months:** `Other` (`n = 6`) and `Livestock` (`n = 4`) lack sample size, while `Wildlife`, `Bird`, and `Reptile` lack reliable birth dates (`65%–76%` unknown `life_stage`), and `intake_health` is MNAR-logged on only `16.6%` of arrivals (`83.4%` unlogged). Monthly cohorts in `America/Chicago` time show `15/18` months meet completeness rules, whereas `2026-08, 2026-09, 2026-10` fail:
 
 | intake_local_month | calendar_days | active_local_days | first_local_date | last_local_date | n_intakes | n_completed | completion_pct | juvenile_intake_pct | median_los_d | mean_los_d | adoption_rate_pct | passes_coverage_rule | coverage_status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -146,16 +176,13 @@ To verify what each group's numbers are made of, we tabulated total valid-sequen
 | 2026-09 | 30 | 30 | 2026-09-01 | 2026-09-30 | 1203 | 889 | 73.9 | 47.3 | 4.73 | 5.76 | 35.3 | False | EXCLUDED (right-censored cohort: 73.9% < 85% closed) |
 | 2026-10 | 31 | 8 | 2026-10-01 | 2026-10-08 | 315 | 95 | 30.2 | 42.9 | 0.65 | 1.49 | 8.4 | False | EXCLUDED (partial edge month: 8/31 active days) |
 
-**Explicit Coverage Rules and Results With vs. Without the Rule:**
-- **Entity / Group Coverage Rule:** Every species summary table requires **`n >= 30` completed stays** (`MIN_GROUP_OUTCOMES = 30`), and any age- or life-stage-stratified comparison requires **`>= 80%` valid `date_of_birth` coverage** (`MIN_DOB_COVERAGE = 0.80`). *Reason:* Prevents small-sample noise (`Livestock n=4`, `Other n=6`) and prevents severe MAR selection bias in `Wildlife`/`Bird`/`Reptile` where `>65%` of birth dates are unrecorded.
-- **Monthly Time-Series Coverage Rule:** Every monthly aggregate requires **`>= 20` active intake days in `America/Chicago` local time** (`MIN_DAYS_PER_MONTH = 20`) AND **`>= 85%` closed outcome completion** (`MIN_COMPLETION_RATE = 0.85`). *Reason:* The first month (`2025-05`) starts after the May 4/5 system cutover, and trailing months at the end of the snapshot have `15%–60%+` of arrivals still in the shelter (`outcome_at IS NULL`). In those right-censored trailing cohorts, only animals with very short stays (`0–10` days) have exited by the snapshot cutoff!
-- **Result With vs. Without the Monthly Coverage Rule (Figure 3, Panel A):** Without the coverage rule, monthly median length of stay appears to plunge from `~8–11` days in summer 2026 down to `1.0–4.2` days in the trailing edge months (`2026-08, 2026-09, 2026-10`), creating the false impression of a dramatic operational speedup. Applying the coverage rule removes the incomplete/right-censored edge cohorts and shifts the cross-month median of monthly medians from `7.53` days (without rule, `n = 18` months) to `8.01` days (with rule, `n = 15` complete, uncensored months).
+**Coverage Rules & Impact (Figure 3A):**
+1. **Group Rule:** Species summaries require `n >= 30` completed stays; age-stratified analyses require `>= 80%` DOB coverage (excluding `Wildlife`/`Bird`/`Reptile` from age models).
+2. **Monthly Rule:** Monthly points require `>= 20` active local days and `>= 85%` closed outcomes. Without this rule, right-censored trailing cohorts (`2026-08, 2026-09, 2026-10`) falsely plunge median stay to `0.65–6.00`d because only fast exits have closed; applying the rule shifts the median of monthly medians from `7.53`d (`18` months) to `8.01`d (`15` complete months).
 
 ### 4.3 The Flag Filter: Stated and Varied
 
-Every M4 query on `stays_clean_view` states its explicit flag filter. We compared two flag filters across all main species (Figure 3, Panel B):
-- **Filter A (Reported Primary Filter):** `days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'` (includes all valid primary stays while excluding the `50–64` `duplicate_exit_for_stay` secondary outcomes, `1–4` negative-duration records, and `13` sequence anomalies).
-- **Filter B (Strict Outlier-Excluded Filter):** `days_in_shelter_flag = 'ok' AND stay_sequence_flag = 'ok'` (additionally drops the `unusual_high_stay` records exceeding species-specific Tukey outer fences `Q3 + 3×IQR`).
+Every M4 query states its flag filter. We compared **Filter A (Reported: `days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'`)** against **Filter B (`days_in_shelter_flag = 'ok'` only)** across the 6 qualifying species (Figure 3B):
 
 | animal_type | n_filter_A_all_valid | n_filter_B_ok_only | n_unusual_removed | median_A_d | median_B_d | mean_A_d | mean_B_d | p95_A_d | p95_B_d | adopt_A_pct | adopt_B_pct |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -166,7 +193,7 @@ Every M4 query on `stays_clean_view` states its explicit flag filter. We compare
 | Bird | 77 | 73 | 4 | 5.8 | 4.99 | 17.07 | 12.08 | 82.89 | 46.58 | 23.4 | 21.9 |
 | Reptile | 34 | 31 | 3 | 6.2 | 5.21 | 27.69 | 9.36 | 105.39 | 30.52 | 35.3 | 35.5 |
 
-**Which Flag Filter We Report and Why:** We report **Filter A (`ok` + `unusual_high_stay`)** for all primary tables and figures, and use Filter B as a sensitivity check. While medians barely move between Filter A and Filter B (`Cat` `7.30`d vs. `7.16`d; `Dog` `9.19`d vs. `8.15`d), switching to Filter B cuts the 95th percentile for `Dog` nearly in half (`124.70`d -> `73.93`d) and drops the `Dog` mean from `28.74`d to `18.81`d. Because `unusual_high_stay` animals are verified, genuine long-term shelter residents rather than measurement errors, excluding them under Filter B would severely understate real kennel occupancy and long-stay rehabilitation burden.
+Medians remain stable under Filter B (`Cat 7.30`d vs. `7.16`d; `Dog 9.19`d vs. `8.15`d), but dropping `unusual_high_stay` cuts `Dog` `p95` nearly in half (`124.7`d -> `73.9`d). Because `unusual_high_stay` represents real long-term shelter residents rather than data errors, we report **Filter A** throughout and keep Filter B as a sensitivity check.
 
 ![Coverage Rule Impact and Flag Filter Sensitivity](../figures/fig3_coverage_and_flag_sensitivity.png)
 
@@ -176,17 +203,17 @@ Every M4 query on `stays_clean_view` states its explicit flag filter. We compare
 
 ### 5.1 Which Clock and Why
 
-In Milestone M2, timestamps (`intake_at`, `outcome_at`) were normalised from Austin local time to `ISO 8601` UTC (`YYYY-MM-DDTHH:MM:SSZ`). However, shelter intake timing, front-desk operating hours (`11:00–19:00`), animal control officer shift handovers, and weekend adoption events are human activities governed by **Austin local wall-clock time (`America/Chicago`, CST `UTC-6` in winter and CDT `UTC-5` during daylight saving time)**. In `src/explore.py` (`fetch_time_indexed_stays()`), we explicitly convert every UTC timestamp via `.dt.tz_convert("America/Chicago")` before extracting hours, weekdays, or calendar dates. Grouping by stored UTC hour shifts Austin's afternoon intake window by 5 to 6 hours: in stored UTC, the modal intake hour appears to be **`17:00` UTC (`16.62%` of intakes)** and heavy activity appears to persist until `23:00` UTC, whereas in `America/Chicago` local time the true intake peak occurs at **`11:00` local time (`18.67%` of intakes)** right as public intake doors open, with `86.4%` of all intakes occurring between `08:00` and `18:00` local time (Figure 4, Panel A).
+M2 stores `ISO 8601` UTC timestamps (`intake_at`), which lag Austin wall-clock time by 5–6 hours (`CDT/CST`). Shelter operations follow Austin local time, so `fetch_time_indexed_stays()` converts every timestamp to **`America/Chicago`**. Stored UTC falsely puts the intake peak at `17:00` UTC (`16.62%`), whereas Austin local time reveals the real opening surge at **`11:00` local time (`18.67%`)**, with `75.4%` arriving during `11:00–16:00` public hours (`92.3%` between `08:00–18:00`, Figure 4A).
 
 ### 5.2 The Edges
 
-Inspecting the start and end boundaries in `America/Chicago` local time shows that the dataset begins on `2025-05-04` (`20:45` CDT, `2025-05-05T01:45:00Z` UTC), missing the first 3.8 days of May 2025 (`28 / 31` active days), and ends on a partial final month (`2026-10`, `8/31` active days). Moreover, late summer / autumn 2026 cohorts (`2026-08, 2026-09, 2026-10`) have `< 85%` closed outcomes because animals admitted near the snapshot boundary are still in shelter care. As shown in Section 4.2, we handle partial edge months by rendering them as explicit shaded gaps in monthly time-series lines (never drawing lines across incomplete periods) and excluding cohorts with `< 85%` completion from longitudinal LOS trend claims.
+In `America/Chicago` time, intakes span `2025-05-04` through `2026-10-08`, leaving `2025-05` slightly partial (`28/31` days post-software cutover) and `2026-10` truncated (`8/31` days), while `2026-08` and `2026-09` fall below `85%` completion. Partial edge months are plotted as shaded gaps rather than connected lines.
 
 ### 5.3 Patterns at Two Time Scales
 
-We examined temporal structure at two distinct scales in `America/Chicago` local time (Figure 4, Panels B and C):
-1. **Fine scale (Hour of Day × Day of Week):** Across days of the week, mean daily intake volume is highest on **weekdays and Saturdays (`~35–40` intakes/day)** and drops sharply on **Sundays (`16.56` intakes/day)** — a `~38%` reduction driven by scheduled front-desk closure for routine `Owner Surrender` and `Community Program` drop-offs (`3.52`/day on Sunday vs. `16.88`/day on Tuesday), while emergency `Stray / ACO Impound` field intakes continue seven days a week.
-2. **Coarse scale (Monthly Seasonal Cycle across 2025–2026):** Monthly intake counts broken down by `life_stage` reveal a dramatic biological seasonality: **Adult arrivals remain relatively stable year-round (`~430–560` adults/month)**, whereas **Juvenile arrivals (`<= 180` days old) more than double during Austin's warm-weather Kitten and Puppy Season (May through July, peaking at `740–840+` juveniles/month, `58%–62%` of all intakes)** before falling to a winter trough in January–February (`~210–260` juveniles/month, `~33%` of intakes).
+Examining local time at daily and monthly scales reveals two distinct regimes (Figure 4B–C; [`sql/queries/m4_time_patterns_and_edges.sql`](../sql/queries/m4_time_patterns_and_edges.sql)):
+- **Fine scale (Day of Week):** Weekday volume holds near `41.4`/day, drops on Saturdays (`22.86`/d), and plunges ~`60%` on **Sundays (`16.56`/d)** because routine owner-surrender desks close (`3.52`/d Sunday vs. `16.88`/d Tuesday) while emergency stray/ACO intake continues.
+- **Coarse scale (Seasonal Months):** Adult intake stays relatively flat (`387–607`/month), whereas **juvenile arrivals more than triple during warm-weather breeding season**, surging from winter lows (`214–255`/month in Jan–Mar) to `893` juveniles in June (`58%–60%` of arrivals).
 
 | day_of_week | n_calendar_dates | total_intakes | mean_intakes_per_day | stray_aco_per_day | owner_community_per_day |
 | --- | --- | --- | --- | --- | --- |
@@ -200,9 +227,7 @@ We examined temporal structure at two distinct scales in `America/Chicago` local
 
 ### 5.4 The Calendar (Holidays and Known Events)
 
-Checking specific US and Austin calendar dates against the median daily intake baseline confirms two strong calendar effects that must be accounted for in daily or weekly comparisons:
-- **Holiday Front-Desk Closures (`Thanksgiving Day 2025-11-27`, `Christmas Day 2025-12-25`, `New Year's Day 2026-01-01`):** Total intakes drop by `65%–89%` below the median day (`4 to 12` intakes/day, `0` owner surrenders), consisting solely of emergency field ACO/ambulance impounds.
-- **Post-Independence Day (July 4th) Fireworks Stray Surge (`July 5–7` in both 2025 and 2026):** While July 4th itself has reduced holiday desk hours, the immediately following reopening days (`2025-07-05`, `2025-07-07`, and `2026-07-07`) surge to `46–61` intakes/day (`+35%` to `+79%` above the median day), dominated by `Stray` and `ACO Impound` dogs and cats frightened by fireworks.
+Checking key US holidays against the median daily intake baseline confirms sharp drops on major holidays (`3–11` intakes/day on Thanksgiving, Christmas, and New Year's Day, `-67.6%` to `-91.2%`) and strong **post-July 4th fireworks stray/ACO spikes** on reopening days (`42` intakes in 2025, `+23.5%`; `64` in 2026, `+88.2%`):
 
 | local_date | calendar_event | n_intakes | stray_aco_intakes | owner_surrenders | vs_median_day_pct | operational_interpretation |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -216,3 +241,141 @@ Checking specific US and Austin calendar dates against the median daily intake b
 | 2026-07-07 | Post-July 4th Surge 2026 (Tue) | 64 | 42 | 2 | 88.2 | Post-fireworks stray/ACO impound peak |
 
 ![Time Clock Shift, Day-of-Week Schedule, and Seasonal Juvenile Surge](../figures/fig4_time_clock_and_scales.png)
+
+---
+
+## 6. Relationships
+
+We plotted `age_at_intake_days` vs. adopted `length_of_stay_days` across `8,411` validated `Cat` and `Dog` adoptions (`date_of_birth_flag = 'ok'`) on shared `0–90`d scales before summarizing (Figure 5).
+
+| animal_type | age_bin | mid_age_months | n | q25_los_d | median_los_d | q75_los_d | mean_los_d |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cat | 0-4w (<1m) | 0.5 | 357 | 43.35 | 54.77 | 64.88 | 56.88 |
+| Cat | 4-6w (1-1.5m) | 1.25 | 799 | 27.28 | 38.19 | 55.2 | 42.93 |
+| Cat | 6-8w (1.5-2m) | 1.75 | 605 | 8.07 | 16.97 | 36.09 | 25.15 |
+| Cat | 2-3m | 2.5 | 873 | 7.04 | 11.19 | 28.24 | 21.38 |
+| Cat | 3-6m | 4.5 | 815 | 7.07 | 12.09 | 31.64 | 23.8 |
+| Cat | 6-12m | 9.0 | 588 | 7.14 | 11.96 | 28.36 | 24.52 |
+| Cat | 1-2y | 18.0 | 338 | 6.71 | 13.13 | 27.13 | 23.41 |
+| Cat | 2-5y | 36.0 | 570 | 7.05 | 14.11 | 33.7 | 28.53 |
+| Cat | 5y+ | 72.0 | 236 | 6.2 | 13.97 | 35.09 | 29.77 |
+| Dog | 0-4w (<1m) | 0.5 | 54 | 55.18 | 62.71 | 72.03 | 65.71 |
+| Dog | 4-6w (1-1.5m) | 1.25 | 79 | 22.97 | 29.18 | 40.56 | 35.08 |
+| Dog | 6-8w (1.5-2m) | 1.75 | 198 | 6.97 | 13.08 | 23.93 | 17.57 |
+| Dog | 2-3m | 2.5 | 430 | 6.2 | 10.18 | 23.31 | 22.71 |
+| Dog | 3-6m | 4.5 | 431 | 8.11 | 18.35 | 41.08 | 34.09 |
+| Dog | 6-12m | 9.0 | 593 | 9.03 | 23.08 | 59.0 | 44.93 |
+| Dog | 1-2y | 18.0 | 351 | 12.07 | 28.99 | 55.39 | 51.26 |
+| Dog | 2-5y | 36.0 | 749 | 12.05 | 31.48 | 79.16 | 59.93 |
+| Dog | 5y+ | 72.0 | 345 | 8.29 | 22.19 | 55.14 | 46.6 |
+
+**Opposite Correlation Signs (`r` vs. `rho`):** Pooled linear Pearson correlation is positive (**$r = +0.0698$**) while Spearman rank correlation is negative (**$\rho = -0.1073$**). Figure 5 explains why Spearman $\rho$ and binned medians capture the true shape: legal/medical sterilization requires **8 weeks (`56`d / ~`2` lbs)**, keeping under-4-week cats in foster care for a median `54.8`d (`Dog 62.7`d) and `4–6w` kittens for `38.2`d before dropping sharply to `11.2`d at `2–3` months. Adult medians flatten (`12–14`d Cats; `22–31`d Dogs), while extreme-stay adult dogs (`120–484`d) pull linear Pearson $r$ upward.
+
+| subset_check | n | pearson_r | spearman_rho | median_age_d | median_los_d |
+| --- | --- | --- | --- | --- | --- |
+| 1. All Adopted Cat + Dog (ok + unusual_high_stay) | 8411 | 0.0698 | -0.1073 | 124.0 | 20.97 |
+| 2. Remove unusual_high_stay tail (ok only) | 7878 | -0.0253 | -0.1788 | 122.0 | 18.21 |
+| 3. Juvenile Adopted Cats (age <= 180d, all valid) | 3449 | -0.2806 | -0.4637 | 56.0 | 24.21 |
+| 4. Juvenile Adopted Cats — remove <42d neonates | 2650 | -0.0771 | -0.2301 | 63.0 | 15.23 |
+| 5. Juvenile Adopted Cats — Peak Season (May-Aug) | 2293 | -0.2965 | -0.4636 | 56.0 | 28.01 |
+| 6. Juvenile Adopted Cats — Off-Peak (Sep-Apr) | 1156 | -0.2508 | -0.4321 | 62.0 | 20.19 |
+| 7. Juvenile Adopted Dogs (age <= 180d, all valid) | 1192 | 0.0183 | -0.0796 | 70.0 | 15.19 |
+| 8. Adult Adopted Cats (age > 180d) | 1732 | 0.0515 | 0.0397 | 730.0 | 13.12 |
+| 9. Adult Adopted Dogs (age > 180d) | 2038 | -0.0232 | 0.0007 | 731.0 | 27.18 |
+
+**Driver Checks:**
+1. **Outliers:** Dropping `unusual_high_stay` (`533` rows) flips pooled Pearson from `+0.0698` to **`-0.0253`** and strengthens Spearman to **`-0.1788`**.
+2. **Neonates:** Within juvenile cats (`\rho = -0.4637`), removing `< 42`-day neonates (`799` rows) cuts Spearman in half to **`-0.2301`**, proving neonate maturation is the core driver.
+3. **Seasonality Check:** Juvenile cat correlation persists similarly in Peak Season (`-0.4636`) and Off-Peak months (`-0.4321`), ruling out seasonal confounding.
+
+![Relationship Between Age at Intake and Length of Stay Until Adoption](../figures/fig5_age_vs_los_relationship.png)
+
+---
+
+## 7. The comparison
+
+### 7.1 Independent Cluster Intervals (`B = 5,000`)
+
+Litters and same-day shelter batches violate stay-level independence, so we bootstrapped **daily intake cohorts (`intake_local_date`, `seed = 42`)** to compare **Dogs (`Group A`, `n = 6,281`, `521` days) vs. Cats (`Group B`, `n = 10,011`, `516` days)** and **Owner Surrenders vs. Strays**:
+
+| comparison_stratum | n_group_A | n_group_B | clusters_A_days | clusters_B_days | median_los_A_d | median_los_B_d | los_diff_A_minus_B_d | los_cluster_95ci | los_naive_95ci | adopt_A_pct | adopt_B_pct | adopt_diff_pct_pt | adopt_cluster_95ci |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1. Pooled All Completed Stays (Dog vs Cat) | 6281 | 10011 | 521 | 516 | 9.19 | 7.3 | 1.89 | [+1.27, +3.69] | [+1.12, +2.69] | 51.63 | 52.15 | -0.52 | [-3.04, +2.04] |
+| 2. Adult Stays Only (Adult Dog vs Adult Cat) | 4136 | 4003 | 519 | 503 | 10.26 | 6.98 | 3.28 | [+3.59, +5.96] | [+2.35, +4.17] | 49.08 | 43.67 | 5.41 | [+2.88, +8.03] |
+| 3. Juvenile Stays Only (Juvenile Dog vs Juvenile Cat) | 2145 | 6008 | 408 | 479 | 8.11 | 8.23 | -0.13 | [-1.14, +2.36] | [-0.97, +0.58] | 56.55 | 57.81 | -1.26 | [-5.94, +3.48] |
+| 4. Adult Non-TNR Stays (excl. Community Program) | 4136 | 1734 | 519 | 466 | 10.26 | 8.02 | 2.23 | [+2.03, +4.74] | [+1.29, +3.62] | 49.08 | 55.59 | -6.51 | [-9.72, -3.21] |
+| 5. Intake Channel: Owner Surrender vs Stray (Cat+Dog) | 1684 | 5524 | 399 | 488 | 8.22 | 9.13 | -0.9 | [-1.00, +2.78] | [-1.67, +0.06] | 70.78 | 58.31 | 12.47 | [+8.63, +16.23] |
+
+### 7.2 Composition Check (Simpson's Paradox)
+
+Checking group composition reveals two major structural imbalances:
+
+| species | n_completed_stays | juvenile_share_pct | adult_share_pct | community_program_share_pct | stray_share_pct | aco_impound_share_pct | owner_surrender_share_pct |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cat | 10011 | 60.0 | 40.0 | 40.4 | 33.2 | 13.3 | 8.4 |
+| Dog | 6281 | 34.2 | 65.8 | 0.1 | 35.1 | 40.3 | 13.4 |
+
+**`60.0%` of Cat stays are Juveniles vs. `34.2%` of Dogs**, and **`40.4%` of Cats enter via `Community Program` TNR vs. `0.1%` of Dogs**, creating **two Simpson's paradox reversals** (Figure 6):
+1. **Adoption Paradox:** Pooled parity (`51.6%` Dog vs. `52.1%` Cat; diff `-0.52` pp, cluster CI `[-3.04, +2.04]`) reverses within adults, where **Adult Dogs exceed Adult Cats by `+5.41` pp** (`49.1%` vs. `43.7%`, cluster CI `[+2.88, +8.03]`) because high-adoption juveniles inflate Cat totals while TNR suppresses Adult Cat adoptions (excluding TNR reverses adults again to `-6.51` pp).
+2. **LOS Reversal:** Pooled Dogs stay `+1.89`d longer (`9.19`d vs. `7.30`d), led by adults (`+3.28`d), but **Juvenile Cats stay slightly longer than Juvenile Dogs** (`8.23`d vs. `8.11`d`, diff `-0.13`d).
+
+### 7.3 Candidate Looks (`LOOK_COUNT = 12`)
+
+To control multiplicity, we logged all `12` inspected contrasts:
+
+| look_index | candidate_comparison | observed_contrast | disposition |
+| --- | --- | --- | --- |
+| 1 | Dog vs Cat — Pooled Median LOS | +1.90 d | Selected (part of focal comparison) |
+| 2 | Dog vs Cat — Pooled Adoption Share | -0.1% to -0.9% | Confounded by juvenile & TNR mixture |
+| 3 | Adult Dog vs Adult Cat — Adoption Share | +5.4% to +5.6% | Selected (Simpson's paradox reversal) |
+| 4 | Juvenile Dog vs Juvenile Cat — Median LOS | -0.04 d to -0.11 d | Selected (juvenile reversal vs adults) |
+| 5 | Owner Surrender vs Stray — Adoption Share | +12.1% to +12.5% | Selected (secondary channel benchmark) |
+| 6 | ACO Impound vs Stray — Adoption Share | -21.2% | Exploratory channel contrast |
+| 7 | Male vs Female — Median LOS (Cat+Dog) | -0.35 d | Small difference; not focal |
+| 8 | Previously Spayed/Neutered vs Intact at Intake — LOS | -1.82 d | Confounded by age at intake |
+| 9 | Peak Kitten Season (May-Aug) vs Winter (Nov-Feb) — Cat LOS | +2.10 d | Seasonal foster backlog |
+| 10 | Named vs Unnamed at Intake — Adoption Share | +9.4% | Proxy for Owner Surrender vs Stray |
+| 11 | Logged Abnormal Health vs Logged Normal — LOS | +6.40 d | Restricted to 16.6% MNAR logged subset |
+| 12 | Wildlife vs Companion Animals — Same-Day Exit Share | +68.5% | Structural triage difference |
+
+Adult Dog vs. Adult Cat adoption gap (`+5.41` pp) and Owner Surrender vs. Stray advantage (`+12.47` pp, CI `[+8.63, +16.23]`) remain clear even under Bonferroni adjustment ($\alpha = 0.05/12 = 0.0042$).
+
+![Simpson's Paradox in Dog vs Cat Adoption Rates and Cluster Bootstrap 95% CIs](../figures/fig6_headline_comparison_simpsons_paradox.png)
+
+---
+
+## 8. Findings
+
+| ID | Finding (one sentence) | Evidence (figure / query) | Label | What would change it | Explored by |
+|---|---|---|---|---|---|
+| `F-01` | Consolidating six raw adoption subtypes (`Adopted Altered`, `Adopted Offsite`, etc.) into canonical `Adopted` lifts measured adoption rate from `45.11%` to `49.73%`, while merging `Kitten`/`Puppy` reduces `Cat` mean stay from `20.86`d to `19.04`d. | `m4_raw_vs_cleaned_key_metrics.sql`; `fig1` (Panel A) | Confirmed (mapping arithmetic) | Reclassifying `Adopted to Finder` or `Adopted Unaltered` in M7 target definitions. | Osman Kalkan |
+| `F-02` | Species LOS rankings invert between the median (`Small Mammal` #1 at `14.12`d, `Wildlife` #6 at `3.95`d) and `p95` (`Wildlife` #1 at `171.7`d, `Dog` #2 at `124.7`d) due to heavy rehab/legal-hold tails up to `484`d. | Section 3 Table; `fig1` (Panel B); `fig2` | Exploratory | Resolving `1,176` open stays or changing wildlife/court-hold transfer rules. | Osman Kalkan |
+| `F-03` | Without our monthly coverage rule (`>=20` active days & `>=85%` closed), trailing censored cohorts (`2026-08, 2026-09, 2026-10`) falsely plunge median stay to `0.65–6.00`d; dropping `unusual_high_stay` under Filter B leaves medians flat (`~7–9`d) while halving `Dog` `p95` (`124.7`d to `73.9`d). | `m4_coverage_by_species_and_month.sql`; `fig3` | Confirmed (censoring & truncation mechanics) | Re-snapshotting October 2026 intakes 90+ days later after open stays close. | Osman Kalkan |
+| `F-04` | Grouping stored UTC shifts Austin's `11:00–16:00` local daytime surge by 5–6h into `17:00` UTC; Sunday desk closures cut intakes ~`60%` (`16.56`/d) while July 4th fireworks drive reopening spikes (`+23.5%` to `+88.2%`). | `m4_time_patterns_and_edges.sql`; `fig4` (Panels A–B) | Exploratory | Changes to Austin front-desk Sunday hours or multi-year holiday baselines. | Irmak Köse |
+| `F-05` | Summer breeding seasonality more than triples monthly juvenile intakes (`214` in Jan vs. `893` in Jun) while adult arrivals stay stable (`387–607`/month). | `fig4` (Panel C) | Exploratory | Multi-year historical baseline separating recurring climate cycles from policy shifts. | Irmak Köse |
+| `F-06` | Among `8,411` adopted pets, pooled Pearson ($r=+0.0698$) and Spearman ($\rho=-0.1073$) take opposite signs because `<42`d unweaned kittens drive a steep juvenile cat foster slope ($\rho=-0.4637$, halved to `-0.2301` without neonates) while long-stay adult dogs lift Pearson $r$. | Section 6 Table; `fig5` | Exploratory | Direct intake weights and foster transfer timestamps per animal. | Irmak Köse |
+| `F-07` | Pooled `Dog` vs. `Cat` adoption parity (`51.6%` vs. `52.1%`, diff `-0.52` pp) hides **Simpson's paradox**: Adult Dogs beat Adult Cats by `+5.41` pp (`49.1%` vs. `43.7%`, CI `[+2.88, +8.03]`) due to `60.0%` juvenile and `40.4%` TNR Cat composition. | `m4_age_los_and_subgroup_comparison.sql`; `fig6` (Panel A) | Confirmed (composition / Simpson's paradox) | Excluding `Community Program` TNR cats flips adults back toward Cats (`55.6%` vs. `49.1%`). | Ferdi Derebaşı |
+| `F-08` | `Owner Surrender` stays achieve `+12.47` pp higher adoption than `Stray` arrivals (`70.8%` vs. `58.3%`, cluster CI `[+8.63, +16.23]`) after `12` looks and avoid the 4-day stray hold (`-0.90`d median diff). | Section 7.1 Table; `fig6` (Panel B) | Exploratory | Adjusting for intake health, age, and breed mix on held-out M7 models. | Ferdi Derebaşı |
+
+### Back to cleaning
+
+Edge-period checks revealed **`Issue I-13`** in M3 ([`docs/cleaning_report.md`](cleaning_report.md)), resolved in [`src/clean.py`](../src/clean.py), [`src/clean_config.py`](../src/clean_config.py), and [`src/validate.py`](../src/validate.py): `MAX_VALID_DATE = "2026-10-08"` previously flagged valid post-Oct 8 neonates as `invalid_future_date`, and `WARN-2` checked stale Oct 1–8 dates. We anchored future-DOB checks dynamically to `max(MAX_VALID_DATE, retrieved_at[:10])` and freshness checks to `MAX(substr(intake_at, 1, 10))`; all 3 `STOP` checks and self-tests pass.
+
+### Forward to modelling
+
+M7 predictive modelling must enforce five guardrails:
+1. **Target & loss:** Predict `log1p(length_of_stay_days)` or quantile loss (`p50`/`p90`) rather than raw MSE, evaluating on both Filter A and Filter B.
+2. **Interactions:** Include `animal_type * life_stage * intake_type` to capture non-linear neonate maturation and Simpson reversals (`F-06`, `F-07`).
+3. **Leakage ban:** Exclude post-outcome fields (`outcomes_clean.spayed_neutered`, `euthanasia_reason`); use only `intakes_clean.previously_spayed_neutered`.
+4. **Censoring-aware splits:** Exclude cohorts within 30–45 days of snapshot cutoff or use survival metrics.
+5. **Thin groups & MNAR indicators:** Drop `Livestock`/`Other` from species claims and encode `83.4%` unlogged `intake_health` and unknown sex as explicit levels.
+
+---
+
+## 9. What we can't say
+
+Across `18,415` valid-sequence stays (`17,238` closed), four boundaries limit inference:
+1. **Single 17-month window (`2025-05-04`–`2026-10-08`):** Only one full winter cycle appears after the May 2025 software migration, preventing separation of weather seasonality from policy changes.
+2. **Boundary censoring:** `1,176` recent intakes remain open (`outcome_at IS NULL`) alongside `1,088` pre-cutover `quarantine` exits, slightly understating multi-year stays.
+3. **Unobserved clinical & foster records:** Front-desk health is `83.4%` unlogged (`MNAR`), and SODA omits weights, foster transfer dates, and behavior scores.
+4. **No causal claims:** Gaps like `+12.5` pp (`Owner Surrender` vs. `Stray`) reflect unmeasured socialization and medical history confounding rather than causal channel effects.
