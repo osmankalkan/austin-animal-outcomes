@@ -809,3 +809,580 @@ def compute_simpsons_paradox_and_intervals(df_time: pd.DataFrame) -> tuple[pd.Da
         columns=["look_index", "candidate_comparison", "observed_contrast", "disposition"],
     )
     return mixture_df, ci_df, looks_df
+
+
+
+# ---------------------------------------------------------------------------
+# Section 4: Publication Figure Generators (6 Figures meeting all 8 rules)
+# ---------------------------------------------------------------------------
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+def apply_m4_plot_style() -> None:
+    plt.rcParams.update({
+        "figure.dpi": 140,
+        "savefig.dpi": 160,
+        "font.size": 9.5,
+        "axes.titlesize": 10.5,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 9.5,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linestyle": "--",
+        "legend.frameon": True,
+        "legend.framealpha": 0.9,
+    })
+
+
+def _add_header_and_caption(fig, title: str, subtitle: str, caption: str) -> None:
+    fig.suptitle(title, fontsize=12, fontweight="bold", y=0.98)
+    fig.text(0.5, 0.935, subtitle, ha="center", va="top", fontsize=9.5, style="italic", color="#333333")
+    fig.text(0.5, 0.01, caption, ha="center", va="bottom", fontsize=8.0, color="#444444")
+
+
+def plot_fig1_raw_vs_cleaned_and_rankings(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 1 (Sections 2.1 & 2.2):
+      - Left panel: Raw M2 vs Cleaned M3 live adoption rate (%) showing the impact of
+        consolidating adoption subtypes and separating Kitten/Puppy into life_stage.
+      - Right panel: Species length-of-stay summary ranking reversal (Median vs Mean vs 95th percentile).
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rvc = compute_raw_vs_cleaned_table(con)
+    ranks = compute_species_summary_rankings(con)
+    ranks_valid = ranks[ranks["passes_coverage_rule"]].copy()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.6))
+
+    # Left panel: Raw exact 'Adopted' vs M3 Cleaned canonical 'Adopted'
+    cohorts = [
+        ("All Stays", "M2 Raw — All Outcomes (unfiltered)", "M3 Cleaned — All Valid Completed Stays"),
+        ("Cat Cohort", "M2 Raw — 'Cat' (excludes raw 'Kitten')", "M3 Cleaned — Canonical 'Cat' (Adult + Juvenile)"),
+        ("Dog Cohort", "M2 Raw — 'Dog' (excludes raw 'Puppy')", "M3 Cleaned — Canonical 'Dog' (Adult + Juvenile)"),
+    ]
+    y_pos = np.arange(len(cohorts))
+    raw_vals = []
+    cln_vals = []
+    for _, r_lbl, c_lbl in cohorts:
+        raw_vals.append(float(rvc.loc[rvc["cohort"] == r_lbl, "adopted_exact_pct"].iloc[0]))
+        cln_vals.append(float(rvc.loc[rvc["cohort"] == c_lbl, "adopted_all_subtypes_pct"].iloc[0]))
+
+    bar_h = 0.34
+    b1 = ax1.barh(y_pos + bar_h / 2, raw_vals, height=bar_h, color="#8c96c6", label="M2 Raw (exact 'Adopted' string)")
+    b2 = ax1.barh(y_pos - bar_h / 2, cln_vals, height=bar_h, color="#2b8cbe", label="M3 Cleaned (canonical 'Adopted' + valid flags)")
+    ax1.axvline(50.0, color="#d95f02", linestyle="--", linewidth=1.2, label="50% parity benchmark")
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels([c[0] for c in cohorts])
+    ax1.set_xlim(0, 70)
+    ax1.set_xlabel("Live Adoption Share (% of completed stays)")
+    ax1.set_title("A. M3 Subtype Mapping Lifts Measured Adoption Rate by ~4-5 pp")
+    ax1.legend(loc="lower right", fontsize=8)
+    for bars in (b1, b2):
+        for bar in bars:
+            w = bar.get_width()
+            ax1.text(w + 0.8, bar.get_y() + bar.get_height() / 2, f"{w:.1f}%", va="center", fontsize=8)
+
+    # Right panel: Summary ranking reversal across species (Median vs Mean vs p95)
+    ranks_valid = ranks_valid.sort_values("median_d", ascending=True)
+    y2 = np.arange(len(ranks_valid))
+    h2 = 0.25
+    ax2.barh(y2 - h2, ranks_valid["median_d"], height=h2, color="#1b9e77", label="Median stay (days) — typical arrival")
+    ax2.barh(y2, ranks_valid["mean_d"], height=h2, color="#d95f02", label="Mean stay (days) — sensitive to tail")
+    ax2.barh(y2 + h2, ranks_valid["p95_d"], height=h2, color="#7570b3", label="95th percentile stay (days) — tail burden")
+    ax2.axvline(STRAY_HOLD_DAYS, color="#444444", linestyle=":", linewidth=1.1, label="4-day mandatory stray hold")
+    ax2.axvline(TARGET_STAY_DAYS, color="#e7298a", linestyle="--", linewidth=1.1, label="14-day shelter target")
+    ax2.set_yticks(y2)
+    ax2.set_yticklabels([f"{r.animal_type} (n={r.n:,})" for _, r in ranks_valid.iterrows()])
+    ax2.set_xlim(0, max(175.0, float(ranks_valid["p95_d"].max()) * 1.12))
+    ax2.set_xlabel("Length of Stay (days, UTC timestamp difference)")
+    ax2.set_title("B. Group Ranking Reverses Between Median (Small Mammal #1) and p95 (Wildlife/Dog)")
+    ax2.legend(loc="lower right", fontsize=8)
+
+    n_raw_all = int(rvc.loc[rvc["cohort"] == "M2 Raw — All Outcomes (unfiltered)", "n"].iloc[0])
+    n_cln_all = int(rvc.loc[rvc["cohort"] == "M3 Cleaned — All Valid Completed Stays", "n"].iloc[0])
+    _add_header_and_caption(
+        fig,
+        title="Cleaning Consolidates Adoption Subtypes while Right-Tail Stays Reverse Species Rankings Across Summaries",
+        subtitle="Question (2.1 & 2.2): How does M3 cleaning change headline metrics, and do median, mean, and p95 rank species the same way?",
+        caption=(
+            f"Source: data/austin_animals.db | M2 Raw n={n_raw_all:,} (unfiltered) vs M3 Cleaned n={n_cln_all:,} "
+            f"| Flag filter: days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok' | Coverage rule: n >= {MIN_GROUP_OUTCOMES} stays."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig1_raw_vs_cleaned_impact.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_fig2_shape_histogram_and_ecdf(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 2 (Section 2.3 — Shape):
+      Shows the distribution of `length_of_stay_days` in two complementary ways:
+      - Left panel: Histogram with justified 2-day natural bin width (0-90 days) showing
+        the day 0-2 triage spike, day 4 stray-hold release peak, and juvenile foster shoulder.
+      - Right panel: Log-scale ECDF (`log1p(days)`) across the 5 main species/life-stage cohorts.
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_sql_query(
+        """
+        SELECT
+            animal_type,
+            life_stage,
+            length_of_stay_days
+        FROM stays_clean_view
+        WHERE outcome_at IS NOT NULL
+          AND days_in_shelter_flag IN ('ok', 'unusual_high_stay')
+          AND stay_sequence_flag = 'ok'
+        """,
+        con,
+    )
+    los = df["length_of_stay_days"].dropna()
+    med_all = float(los.median())
+    p90_all = float(los.quantile(0.90))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.6))
+
+    # Left panel: 2-day bin width histogram (0 to 90 days)
+    bins = np.arange(0.0, HIST_MAX_DAYS + HIST_BIN_WIDTH_DAYS, HIST_BIN_WIDTH_DAYS)
+    clipped = los[los <= HIST_MAX_DAYS]
+    n_beyond = int((los > HIST_MAX_DAYS).sum())
+    ax1.hist(clipped, bins=bins, color="#3182bd", edgecolor="white", alpha=0.88)
+    ax1.axvline(STRAY_HOLD_DAYS, color="#d95f02", linestyle="--", linewidth=1.4, label=f"Mandatory stray hold ({STRAY_HOLD_DAYS:.0f}d)")
+    ax1.axvline(med_all, color="#1b9e77", linestyle="-", linewidth=1.5, label=f"Overall median ({med_all:.1f}d)")
+    ax1.axvline(TARGET_STAY_DAYS, color="#e7298a", linestyle=":", linewidth=1.4, label=f"Operational target ({TARGET_STAY_DAYS:.0f}d)")
+    ax1.set_xlim(0, HIST_MAX_DAYS)
+    ax1.set_xlabel("Length of Stay (days, 2-day natural bins; 0 to 90d window)")
+    ax1.set_ylabel("Completed Shelter Stays (count)")
+    ax1.set_title(f"A. Histogram (2-Day Bins, 0-90d; {n_beyond:,} tail stays >90d omitted from axis)")
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # Right panel: ECDF on log1p(days) scale by group
+    cohort_defs = [
+        ("Cat — Adult", df[(df["animal_type"] == "Cat") & (df["life_stage"] == "adult")]["length_of_stay_days"], "#1b9e77"),
+        ("Cat — Juvenile", df[(df["animal_type"] == "Cat") & (df["life_stage"] == "juvenile")]["length_of_stay_days"], "#66a61e"),
+        ("Dog — Adult", df[(df["animal_type"] == "Dog") & (df["life_stage"] == "adult")]["length_of_stay_days"], "#d95f02"),
+        ("Dog — Juvenile", df[(df["animal_type"] == "Dog") & (df["life_stage"] == "juvenile")]["length_of_stay_days"], "#e6ab02"),
+        ("Wildlife (All)", df[df["animal_type"] == "Wildlife"]["length_of_stay_days"], "#7570b3"),
+    ]
+    for label, s_grp, color in cohort_defs:
+        s_clean = np.sort(s_grp.dropna().to_numpy(dtype=float))
+        if len(s_clean) == 0:
+            continue
+        y_ecdf = np.arange(1, len(s_clean) + 1) / len(s_clean)
+        ax2.step(np.log1p(s_clean), y_ecdf, where="post", linewidth=1.7, color=color, label=f"{label} (n={len(s_clean):,})")
+
+    ax2.axhline(0.50, color="#666666", linestyle="--", linewidth=1.0, label="50th percentile (Median)")
+    ax2.axhline(0.90, color="#999999", linestyle=":", linewidth=1.0, label="90th percentile (p90)")
+    tick_days = [0, 1, 4, 7, 14, 30, 60, 120, 365]
+    ax2.set_xticks([np.log1p(d) for d in tick_days])
+    ax2.set_xticklabels([f"{d}d" for d in tick_days])
+    ax2.set_ylim(0, 1.02)
+    ax2.set_xlabel("Length of Stay (days, log(1 + days) scale)")
+    ax2.set_ylabel("Cumulative Share of Completed Stays (ECDF)")
+    ax2.set_title("B. Log-Scale ECDF Exposes Same-Day Wildlife Exits vs Adult Dog Right Tail")
+    ax2.legend(loc="lower right", fontsize=8)
+
+    _add_header_and_caption(
+        fig,
+        title="Length of Stay Is Strongly Right-Skewed with a Day-4 Stray-Hold Peak and a Secondary Foster Wave",
+        subtitle="Question (2.3): What is the shape of length_of_stay_days overall and across species/life-stage groups?",
+        caption=(
+            f"Source: stays_clean_view (n={len(los):,} completed stays; overall median={med_all:.2f}d, p90={p90_all:.1f}d) "
+            f"| Flag filter: days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig2_los_shape_hist_ecdf.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_fig3_coverage_and_flag_sensitivity(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 3 (Section 2.4 — Coverage Rules & Flag Filter Sensitivity):
+      - Left panel: Monthly outcome completion rate (%) and median stay with vs without the
+        monthly coverage rule (>=20 active days & >=85% cohort completion in America/Chicago).
+      - Right panel: Species median and 95th percentile stay under Filter A (ok + unusual_high_stay)
+        vs Filter B (ok only, dropping unusual_high_stay).
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_time = fetch_time_indexed_stays(con)
+    m_cov = compute_monthly_coverage_and_rule(df_time)
+    f_sens = compute_flag_filter_sensitivity(con)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.6))
+
+    # Left panel: Monthly median LOS with vs without coverage rule (gaps/hollow markers for excluded edge months)
+    x_idx = np.arange(len(m_cov))
+    all_meds = m_cov["median_los_d"].to_numpy(dtype=float)
+    rule_meds = np.where(m_cov["passes_coverage_rule"], all_meds, np.nan)
+
+    ax1.plot(x_idx, all_meds, color="#bdbdbd", linestyle="--", marker="o", markersize=5, label="Without coverage rule (includes edge/censored months)")
+    ax1.plot(x_idx, rule_meds, color="#08519c", linestyle="-", marker="s", markersize=6, linewidth=2.0, label="With coverage rule (>=20d active & >=85% closed)")
+
+    for i, row in m_cov.iterrows():
+        if not row["passes_coverage_rule"]:
+            ax1.axvspan(i - 0.4, i + 0.4, color="#fee0d2", alpha=0.55)
+            ax1.annotate(
+                f"{row['completion_pct']:.0f}%\nclosed",
+                (i, row["median_los_d"]),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=7.5,
+                color="#a50f15",
+            )
+
+    ax1.axhline(TARGET_STAY_DAYS, color="#e7298a", linestyle=":", linewidth=1.2, label="14-day shelter target")
+    ax1.set_xticks(x_idx)
+    ax1.set_xticklabels(m_cov["intake_local_month"], rotation=45, ha="right", fontsize=8)
+    ax1.set_ylim(0, max(16.0, float(np.nanmax(all_meds)) * 1.25))
+    ax1.set_xlabel("Intake Cohort Month (America/Chicago local clock)")
+    ax1.set_ylabel("Cohort Median Length of Stay (days)")
+    ax1.set_title("A. Unfiltered Trailing Months Drop Artificially Due to Right-Censoring")
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # Right panel: Flag filter sensitivity (Filter A vs Filter B on Median and p95)
+    sp_order = f_sens.sort_values("p95_A_d", ascending=True)
+    y_pos = np.arange(len(sp_order))
+    h = 0.22
+    ax2.barh(y_pos + 1.5 * h, sp_order["p95_A_d"], height=h, color="#d95f02", label="p95 — Filter A (ok + unusual_high_stay, reported)")
+    ax2.barh(y_pos + 0.5 * h, sp_order["p95_B_d"], height=h, color="#fdb863", label="p95 — Filter B (ok only, drops >Q3+3*IQR)")
+    ax2.barh(y_pos - 0.5 * h, sp_order["median_A_d"], height=h, color="#1b9e77", label="Median — Filter A (ok + unusual_high_stay)")
+    ax2.barh(y_pos - 1.5 * h, sp_order["median_B_d"], height=h, color="#a6dba0", label="Median — Filter B (ok only)")
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels([f"{r.animal_type}\n(A:{r.n_filter_A_all_valid:,} / B:{r.n_filter_B_ok_only:,})" for _, r in sp_order.iterrows()])
+    ax2.set_xlim(0, max(175.0, float(sp_order["p95_A_d"].max()) * 1.12))
+    ax2.set_xlabel("Length of Stay (days)")
+    ax2.set_title("B. Dropping unusual_high_stay Cuts Dog/Wildlife p95 Nearly in Half")
+    ax2.legend(loc="lower right", fontsize=7.8)
+
+    n_inc_m = int(m_cov["passes_coverage_rule"].sum())
+    n_tot_m = len(m_cov)
+    _add_header_and_caption(
+        fig,
+        title="Coverage Rules Prevent Right-Censored Trailing Drops while Outlier Flag Removal Truncates the 95th Percentile",
+        subtitle="Question (2.4): How do coverage rules and the choice of flag filter change monthly trends and species summaries?",
+        caption=(
+            f"Source: stays_clean_view (n={len(df_time):,} valid-sequence intakes across {n_tot_m} months; {n_inc_m}/{n_tot_m} months pass >=20 active days & >=85% completion in America/Chicago) "
+            f"| Reported flag filter: Filter A (days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok')."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig3_coverage_and_flag_sensitivity.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_fig4_time_clock_and_scales(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 4 (Section 2.5 — Time Clock, Edges, Two Scales & Calendar):
+      - Panel A: Hour-of-day intake distribution comparing Austin Local Time (America/Chicago)
+        vs stored UTC (demonstrating the 5-6 hour UTC shift).
+      - Panel B: Day-of-week mean daily intake rate split by intake channel (bars start at 0).
+      - Panel C: Complete-month seasonal intake volume for Juvenile vs Adult animals, highlighting
+        the May-July Kitten/Puppy surge and July 4th stray spike.
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_time = fetch_time_indexed_stays(con)
+    hourly_df, dow_df, cal_df = compute_hourly_and_weekday_profiles(df_time)
+    m_cov = compute_monthly_coverage_and_rule(df_time)
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15.5, 5.4))
+
+    # Panel A: Hourly profile (America/Chicago vs UTC)
+    hours = hourly_df["hour"].to_numpy()
+    ax1.axvspan(11, 19, color="#e5f5e0", alpha=0.65, label="Public shelter hours (11:00-19:00 Local)")
+    ax1.plot(hours, hourly_df["pct_local_chicago"], color="#006d2c", marker="o", linewidth=2.0, label="Austin Local (America/Chicago)")
+    ax1.plot(hours, hourly_df["pct_stored_utc"], color="#cb181d", linestyle="--", marker="^", linewidth=1.6, label="Stored UTC (unadjusted +5/+6h shift)")
+    ax1.set_xticks(range(0, 24, 3))
+    ax1.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 3)])
+    ax1.set_ylim(0, max(float(hourly_df["pct_local_chicago"].max()), float(hourly_df["pct_stored_utc"].max())) * 1.15)
+    ax1.set_xlabel("Hour of Day (00:00-23:00)")
+    ax1.set_ylabel("Share of All Intakes (%)")
+    ax1.set_title("A. Stored UTC Shifts 11:00-16:00 Local Peak Into Evening")
+    ax1.legend(loc="upper left", fontsize=7.5)
+
+    # Panel B: Day of week mean intakes/day (bars start at 0)
+    x_dow = np.arange(len(dow_df))
+    w = 0.38
+    ax2.bar(x_dow - w / 2, dow_df["stray_aco_per_day"], width=w, color="#3182bd", label="Stray + ACO Impound")
+    ax2.bar(x_dow + w / 2, dow_df["owner_community_per_day"], width=w, color="#fd8d3c", label="Owner Surrender + Community + Return")
+    overall_daily_mean = float(dow_df["mean_intakes_per_day"].mean())
+    ax2.axhline(overall_daily_mean, color="#333333", linestyle="--", linewidth=1.1, label=f"Mean total/day ({overall_daily_mean:.1f}/d)")
+    ax2.set_xticks(x_dow)
+    ax2.set_xticklabels([d[:3] for d in dow_df["day_of_week"]])
+    ax2.set_ylim(0, float(dow_df["mean_intakes_per_day"].max()) * 1.15)
+    ax2.set_xlabel("Day of Week (America/Chicago local clock)")
+    ax2.set_ylabel("Mean Intakes per Calendar Day (count/day)")
+    ax2.set_title("B. Sunday Intake Drop Driven by Front-Desk Schedule")
+    ax2.legend(loc="upper right", fontsize=7.5)
+
+    # Panel C: Monthly Juvenile vs Adult intakes across complete months (>=20 active days)
+    complete_months = set(m_cov.loc[m_cov["active_local_days"] >= MIN_DAYS_PER_MONTH, "intake_local_month"])
+    m_stage = (
+        df_time.groupby(["intake_local_month", "life_stage"])["animal_key"]
+        .count()
+        .unstack(fill_value=0)
+        .reindex(m_cov["intake_local_month"], fill_value=0)
+    )
+    xm = np.arange(len(m_cov))
+    juv_series = np.where(m_cov["intake_local_month"].isin(complete_months), m_stage.get("juvenile", 0), np.nan)
+    adt_series = np.where(m_cov["intake_local_month"].isin(complete_months), m_stage.get("adult", 0), np.nan)
+
+    ax3.plot(xm, juv_series, color="#d95f02", marker="o", linewidth=2.0, label="Juvenile arrivals (<=180d, complete months)")
+    ax3.plot(xm, adt_series, color="#1f78b4", marker="s", linewidth=2.0, label="Adult arrivals (>180d, complete months)")
+    for i, row in m_cov.iterrows():
+        if row["intake_local_month"] not in complete_months:
+            ax3.axvspan(i - 0.4, i + 0.4, color="#eeeeee", alpha=0.9, label="Partial edge month (<20d, gap)" if i == len(m_cov) - 1 else None)
+    ax3.set_xticks(xm)
+    ax3.set_xticklabels(m_cov["intake_local_month"], rotation=45, ha="right", fontsize=7.5)
+    ax3.set_ylim(0, max(float(np.nanmax(juv_series)), float(np.nanmax(adt_series))) * 1.18)
+    ax3.set_xlabel("Intake Month (America/Chicago; partial edges shown as gaps)")
+    ax3.set_ylabel("Monthly Intake Count (animals/month)")
+    ax3.set_title("C. May-July Kitten/Puppy Surge Doubles Juvenile Volume")
+    ax3.legend(loc="upper right", fontsize=7.5)
+
+    _add_header_and_caption(
+        fig,
+        title="Daytime Shelter Hours (11:00-17:00 Local) and the May-July Juvenile Surge Govern Intake Timing",
+        subtitle="Question (2.5): How do intake volumes behave across local vs UTC hours, days of week, and seasonal calendar months?",
+        caption=(
+            f"Source: stays_clean_view (n={len(df_time):,} valid-sequence intakes converted from UTC to America/Chicago CST/CDT) "
+            f"| Flag filter: stay_sequence_flag = 'ok' | Coverage rule: monthly lines require >={MIN_DAYS_PER_MONTH} active local days."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig4_time_clock_and_scales.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_fig5_age_vs_los_relationship(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 5 (Section 2.6 — Relationship Plotted First + Driver Check):
+      Two-panel small multiples with identical y-axis scale (0-90 days) comparing
+      Age at Intake (months) vs Length of Stay (days) for Adopted Cats vs Adopted Dogs,
+      with scatter points, age-binned medians + IQR bars, surgical age threshold (8 weeks),
+      and annotated Pearson r vs Spearman rho before and after neonate/outlier removal.
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    adopted, binned_df, corr_df = compute_age_los_relationship(con)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.6), sharey=True)
+
+    for ax, sp, color_pt, color_ln in [
+        (ax1, "Cat", "#9ecae1", "#08519c"),
+        (ax2, "Dog", "#fdd0a2", "#d94801"),
+    ]:
+        sub = adopted[adopted["animal_type"] == sp].copy()
+        # Plot up to 60 months (5 years) on x-axis so juvenile structure is clearly resolved
+        sub_plot = sub[sub["age_months"] <= 60.0]
+        ax.scatter(
+            sub_plot["age_months"],
+            sub_plot["length_of_stay_days"].clip(upper=90.0),
+            alpha=0.14,
+            s=12,
+            color=color_pt,
+            label=f"Individual adopted stays (n={len(sub):,})",
+        )
+        b_sp = binned_df[(binned_df["animal_type"] == sp) & (binned_df["mid_age_months"] <= 60.0)]
+        yerr_low = b_sp["median_los_d"] - b_sp["q25_los_d"]
+        yerr_high = b_sp["q75_los_d"] - b_sp["median_los_d"]
+        ax.errorbar(
+            b_sp["mid_age_months"],
+            b_sp["median_los_d"],
+            yerr=[yerr_low, yerr_high],
+            fmt="-o",
+            color=color_ln,
+            linewidth=2.2,
+            markersize=6,
+            capsize=4,
+            label="Age-bin Median LOS +/- IQR (Q1-Q3)",
+        )
+        ax.axvline(SURGICAL_AGE_DAYS / 30.4375, color="#e7298a", linestyle="--", linewidth=1.3, label="8-week surgical threshold (1.8m)")
+        ax.axhline(TARGET_STAY_DAYS, color="#444444", linestyle=":", linewidth=1.1, label="14-day shelter target")
+
+        juv = sub[sub["age_days"] <= 180]
+        adt = sub[sub["age_days"] > 180]
+        r_juv_p = juv["age_days"].corr(juv["length_of_stay_days"], method="pearson")
+        r_juv_s = juv["age_days"].corr(juv["length_of_stay_days"], method="spearman")
+        r_adt_p = adt["age_days"].corr(adt["length_of_stay_days"], method="pearson")
+        r_adt_s = adt["age_days"].corr(adt["length_of_stay_days"], method="spearman")
+
+        ax.text(
+            0.97,
+            0.84,
+            (
+                f"Juvenile (<=6m, n={len(juv):,}):\n"
+                f"  Pearson r = {r_juv_p:+.2f}, Spearman rho = {r_juv_s:+.2f}\n"
+                f"Adult (>6m, n={len(adt):,}):\n"
+                f"  Pearson r = {r_adt_p:+.2f}, Spearman rho = {r_adt_s:+.2f}"
+            ),
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8.2,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92},
+        )
+        ax.set_xlim(-1, 60)
+        ax.set_ylim(0, 90)
+        ax.set_xlabel("Age at Intake (months, from date_of_birth to intake_at; 0-60m window)")
+        ax.set_title(f"{'A' if sp == 'Cat' else 'B'}. Adopted {sp}s: Binned Median & IQR Across Age at Intake")
+        ax.legend(loc="upper right", fontsize=7.8)
+
+    ax1.set_ylabel("Length of Stay Until Adoption (days, clipped at 90d for display)")
+
+    r_all_p = float(corr_df.iloc[0]["pearson_r"])
+    r_all_s = float(corr_df.iloc[0]["spearman_rho"])
+    _add_header_and_caption(
+        fig,
+        title="Unweaned Neonates (<8 Weeks) Drive a Strong Negative Age-Stay Slope in Kittens while Adult Dogs Flatten It",
+        subtitle="Question (2.6): How does age at intake relate to length of stay until adoption, and what drives Pearson vs Spearman?",
+        caption=(
+            f"Source: stays_clean_view (n={len(adopted):,} adopted Cat & Dog stays with valid DOB; pooled Pearson r={r_all_p:+.3f} vs Spearman rho={r_all_s:+.3f}) "
+            f"| Flag filter: outcome_status='Adopted' AND days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND date_of_birth_flag='ok'."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig5_age_vs_los_relationship.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_fig6_headline_simpsons_paradox(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
+    """
+    Figure 6 (Section 2.7 & README Headline Figure):
+      - Left panel: Live Adoption Share (%) comparing Dogs vs Cats Pooled (Overall) and
+        stratified by Life Stage (Adult vs Juvenile) and Non-TNR status, visually demonstrating
+        Simpson's paradox (Cats appear equal/higher overall only because 60% of Cats are high-adoption juveniles).
+      - Right panel: Cluster-bootstrapped 95% confidence intervals (bootstrapped over daily intake
+        cohorts `intake_local_date`, B=5,000, seed=42) vs naive stay-level CIs across 5 focal contrasts.
+    """
+    apply_m4_plot_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df_time = fetch_time_indexed_stays(con)
+    _, ci_df, _ = compute_simpsons_paradox_and_intervals(df_time)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.8, 5.8))
+
+    # Left panel: Grouped bars starting at 0 showing Simpson's paradox in Adoption Share (%)
+    strata_rows = ci_df.iloc[:4].copy()
+    short_labels = [
+        "1. Pooled (All Stays)\n[Confounded by 60% Cat Juveniles]",
+        "2. Adult Stays Only\n(>180d at intake — Reverses!)",
+        "3. Juvenile Stays Only\n(<=180d at intake)",
+        "4. Adult Non-TNR Stays\n(excl. Community Program)",
+    ]
+    x_pos = np.arange(len(strata_rows))
+    w = 0.35
+    b_dog = ax1.bar(x_pos - w / 2, strata_rows["adopt_A_pct"], width=w, color="#d95f02", label="Dog (Group A)")
+    b_cat = ax1.bar(x_pos + w / 2, strata_rows["adopt_B_pct"], width=w, color="#1b9e77", label="Cat (Group B)")
+    ax1.axhline(50.0, color="#666666", linestyle=":", linewidth=1.1, label="50% adoption reference")
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(short_labels, fontsize=8.2)
+    ax1.set_ylim(0, 72)
+    ax1.set_ylabel("Live Adoption Rate (% of completed stays)")
+    ax1.set_title("A. Simpson's Paradox: Adult Dogs Beat Adult Cats (+5.5 pp) Despite Pooled Parity")
+    ax1.legend(loc="upper right", fontsize=8)
+
+    for bars in (b_dog, b_cat):
+        for bar in bars:
+            h_val = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width() / 2, h_val + 1.0, f"{h_val:.1f}%", ha="center", va="bottom", fontsize=7.8)
+
+    # Right panel: Forest plot of Adoption Rate Difference (Group A - Group B, pp) with Cluster vs Naive 95% CI
+    y_pos = np.arange(len(ci_df))
+    diffs = ci_df["adopt_diff_pct_pt"].to_numpy(dtype=float)
+
+    cl_lows, cl_highs = [], []
+    for s_ci in ci_df["adopt_cluster_95ci"]:
+        lo, hi = [float(x) for x in s_ci.strip("[]").split(",")]
+        cl_lows.append(lo)
+        cl_highs.append(hi)
+    cl_lows = np.array(cl_lows)
+    cl_highs = np.array(cl_highs)
+
+    ax2.axvline(0.0, color="#333333", linestyle="--", linewidth=1.3, label="Zero difference (null reference)")
+    ax2.errorbar(
+        diffs,
+        y_pos,
+        xerr=[diffs - cl_lows, cl_highs - diffs],
+        fmt="o",
+        color="#08519c",
+        ecolor="#08519c",
+        elinewidth=2.2,
+        capsize=4,
+        markersize=6.5,
+        label=f"95% Cluster Bootstrap CI (unit = daily cohort, B={BOOTSTRAP_ITERATIONS:,})",
+    )
+    for i, (d_val, lo, hi) in enumerate(zip(diffs, cl_lows, cl_highs)):
+        ax2.text(
+            d_val,
+            i + 0.23,
+            f"{d_val:+.1f} pp [{lo:+.1f}, {hi:+.1f}]",
+            ha="center",
+            va="bottom",
+            fontsize=7.8,
+            color="#08519c",
+            fontweight="bold",
+        )
+
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels([
+        "1. Pooled: Dog - Cat",
+        "2. Adults: Dog - Cat",
+        "3. Juveniles: Dog - Cat",
+        "4. Adult Non-TNR: Dog - Cat",
+        "5. Owner Surrender - Stray",
+    ], fontsize=8.5)
+    ax2.invert_yaxis()
+    ax2.set_xlim(min(-18.0, float(cl_lows.min()) - 4.0), max(20.0, float(cl_highs.max()) + 4.0))
+    ax2.set_xlabel("Adoption Rate Difference: Group A minus Group B (percentage points)")
+    ax2.set_title(f"B. Cluster-Bootstrapped 95% CIs Across Subgroups (Look Count = {LOOK_COUNT})")
+    ax2.legend(loc="lower right", fontsize=7.8)
+
+    n_dog = int(ci_df.iloc[0]["n_group_A"])
+    n_cat = int(ci_df.iloc[0]["n_group_B"])
+    _add_header_and_caption(
+        fig,
+        title="Life-Stage Composition Masks Adult Dog Adoption Advantage and Longer Adult Dog Stays (Simpson's Paradox)",
+        subtitle=f"Question (2.7): How do Dogs and Cats compare on adoption rate and stay duration after accounting for composition and {LOOK_COUNT} looks?",
+        caption=(
+            f"Source: stays_clean_view (Dog n={n_dog:,}, Cat n={n_cat:,}; clustered by America/Chicago intake_local_date, B={BOOTSTRAP_ITERATIONS:,}, seed={RANDOM_SEED}, looks={LOOK_COUNT}) "
+            f"| Flag filter: days_in_shelter_flag IN ('ok', 'unusual_high_stay') AND stay_sequence_flag = 'ok'."
+        ),
+    )
+    fig.tight_layout(rect=[0, 0.04, 1, 0.91])
+    out_path = out_dir / "fig6_headline_comparison_simpsons_paradox.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def generate_all_m4_figures(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> list[Path]:
+    """Generates all 6 M4 figures deterministically and returns their paths."""
+    return [
+        plot_fig1_raw_vs_cleaned_and_rankings(con, out_dir),
+        plot_fig2_shape_histogram_and_ecdf(con, out_dir),
+        plot_fig3_coverage_and_flag_sensitivity(con, out_dir),
+        plot_fig4_time_clock_and_scales(con, out_dir),
+        plot_fig5_age_vs_los_relationship(con, out_dir),
+        plot_fig6_headline_simpsons_paradox(con, out_dir),
+    ]
