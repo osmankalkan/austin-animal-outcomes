@@ -332,3 +332,480 @@ def compute_flag_filter_sensitivity(con: sqlite3.Connection) -> pd.DataFrame:
             "adopt_B_pct": round(float((sub_b["outcome_status"] == "Adopted").mean() * 100.0), 1),
         })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Section 2.5: Time Clock Conversion (UTC -> America/Chicago), Edges & Scales
+# ---------------------------------------------------------------------------
+
+def fetch_time_indexed_stays(con: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Loads stays from `stays_clean_view` and explicitly converts `intake_at` and `outcome_at`
+    from stored UTC (`YYYY-MM-DDTHH:MM:SSZ`) to Austin local wall-clock time (`America/Chicago`).
+    """
+    df = pd.read_sql_query(
+        """
+        SELECT
+            animal_key,
+            animal_id,
+            animal_type,
+            life_stage,
+            sex,
+            date_of_birth,
+            intake_at,
+            intake_type,
+            intake_health,
+            found_zip,
+            stay_sequence_flag,
+            outcome_at,
+            outcome_status,
+            spayed_neutered,
+            days_in_shelter,
+            length_of_stay_days,
+            days_in_shelter_flag
+        FROM stays_clean_view
+        WHERE stay_sequence_flag = 'ok'
+        """,
+        con,
+    )
+
+    intake_utc = pd.to_datetime(df["intake_at"], format="%Y-%m-%dT%H:%M:%SZ", utc=True)
+    intake_local = intake_utc.dt.tz_convert(LOCAL_TZ_NAME)
+
+    df["intake_utc_hour"] = intake_utc.dt.hour
+    df["intake_local_dt"] = intake_local
+    df["intake_local_date"] = intake_local.dt.strftime("%Y-%m-%d")
+    df["intake_local_month"] = intake_local.dt.strftime("%Y-%m")
+    df["intake_local_hour"] = intake_local.dt.hour
+    df["intake_local_dow_num"] = intake_local.dt.dayofweek  # 0=Mon .. 6=Sun
+    df["intake_local_dow"] = intake_local.dt.day_name()
+    return df
+
+
+def compute_monthly_coverage_and_rule(df_time: pd.DataFrame) -> pd.DataFrame:
+    """
+    Section 2.4 & 2.5: Evaluates every local calendar month (`America/Chicago`) against
+    the two-part monthly coverage rule:
+      1) active_local_days >= MIN_DAYS_PER_MONTH (20 days)
+      2) completion_rate >= MIN_COMPLETION_RATE (85% of cohort has a valid closed outcome)
+    Shows monthly median/mean LOS both WITH and WITHOUT the coverage rule.
+    """
+    valid_completed = df_time["outcome_at"].notna() & df_time["days_in_shelter_flag"].isin(PRIMARY_FLAG_FILTER)
+    df_time = df_time.copy()
+    df_time["is_valid_completed"] = valid_completed
+
+    rows = []
+    for month, grp in df_time.groupby("intake_local_month"):
+        year_i, mon_i = map(int, month.split("-"))
+        cal_days = pd.Period(month, freq="M").days_in_month
+        active_days = grp["intake_local_date"].nunique()
+        n_intakes = len(grp)
+        comp = grp[grp["is_valid_completed"]]
+        n_comp = len(comp)
+        comp_rate = n_comp / n_intakes if n_intakes else 0.0
+        passes_days = active_days >= MIN_DAYS_PER_MONTH
+        passes_comp = comp_rate >= MIN_COMPLETION_RATE
+        passes_rule = bool(passes_days and passes_comp)
+
+        los = comp["length_of_stay_days"].dropna()
+        juv_share = (grp["life_stage"] == "juvenile").mean() * 100.0
+        adopt_share = (comp["outcome_status"] == "Adopted").mean() * 100.0 if n_comp else np.nan
+
+        if not passes_days:
+            status_note = f"EXCLUDED (partial edge month: {active_days}/{cal_days} active days)"
+        elif not passes_comp:
+            status_note = f"EXCLUDED (right-censored cohort: {comp_rate*100:.1f}% < {MIN_COMPLETION_RATE*100:.0f}% closed)"
+        else:
+            status_note = "INCLUDED (complete & uncensored)"
+
+        rows.append({
+            "intake_local_month": month,
+            "calendar_days": int(cal_days),
+            "active_local_days": int(active_days),
+            "first_local_date": grp["intake_local_date"].min(),
+            "last_local_date": grp["intake_local_date"].max(),
+            "n_intakes": int(n_intakes),
+            "n_completed": int(n_comp),
+            "completion_pct": round(comp_rate * 100.0, 1),
+            "juvenile_intake_pct": round(float(juv_share), 1),
+            "median_los_d": round(float(los.median()), 2) if len(los) else np.nan,
+            "mean_los_d": round(float(los.mean()), 2) if len(los) else np.nan,
+            "adoption_rate_pct": round(float(adopt_share), 1) if not np.isnan(adopt_share) else np.nan,
+            "passes_coverage_rule": passes_rule,
+            "coverage_status": status_note,
+        })
+    return pd.DataFrame(rows).sort_values("intake_local_month").reset_index(drop=True)
+
+
+def compute_hourly_and_weekday_profiles(df_time: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Section 2.5: Computes (1) hourly intake profile in America/Chicago vs stored UTC,
+    (2) day-of-week intake rate by channel, and (3) calendar/holiday intake checks.
+    """
+    # 1. Hourly profile: Local vs UTC
+    hourly_rows = []
+    n_total = len(df_time)
+    for h in range(24):
+        n_loc = int((df_time["intake_local_hour"] == h).sum())
+        n_utc = int((df_time["intake_utc_hour"] == h).sum())
+        hourly_rows.append({
+            "hour": h,
+            "n_local_chicago": n_loc,
+            "pct_local_chicago": round(100.0 * n_loc / n_total, 2),
+            "n_stored_utc": n_utc,
+            "pct_stored_utc": round(100.0 * n_utc / n_total, 2),
+        })
+    hourly_df = pd.DataFrame(hourly_rows)
+
+    # 2. Day of week profile (normalised by number of distinct calendar dates per weekday)
+    dow_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    dow_rows = []
+    for d_idx, d_name in enumerate(dow_order):
+        sub = df_time[df_time["intake_local_dow_num"] == d_idx]
+        n_dates = max(sub["intake_local_date"].nunique(), 1)
+        n_stray_aco = int(sub["intake_type"].isin(["Stray", "ACO Impound"]).sum())
+        n_owner_comm = int(sub["intake_type"].isin(["Owner Surrender", "Community Program", "Return"]).sum())
+        dow_rows.append({
+            "day_of_week": d_name,
+            "n_calendar_dates": n_dates,
+            "total_intakes": int(len(sub)),
+            "mean_intakes_per_day": round(len(sub) / n_dates, 2),
+            "stray_aco_per_day": round(n_stray_aco / n_dates, 2),
+            "owner_community_per_day": round(n_owner_comm / n_dates, 2),
+        })
+    dow_df = pd.DataFrame(dow_rows)
+
+    # 3. Calendar / Holiday check
+    daily_counts = (
+        df_time.groupby("intake_local_date")
+        .agg(
+            n_intakes=("animal_key", "count"),
+            n_stray_aco=("intake_type", lambda s: int(s.isin(["Stray", "ACO Impound"]).sum())),
+            n_owner=("intake_type", lambda s: int((s == "Owner Surrender").sum())),
+        )
+        .reset_index()
+    )
+    baseline_daily = float(daily_counts["n_intakes"].median())
+
+    holiday_checks = [
+        ("2025-07-04", "Independence Day (July 4th)", "Holiday closure / fireworks evening"),
+        ("2025-07-05", "Post-July 4th Stray Surge (Day +1)", "Fireworks runaway impound surge"),
+        ("2025-07-07", "Post-July 4th Weekday Reopening", "Post-holiday backlog & stray surge"),
+        ("2025-11-27", "Thanksgiving Day 2025", "Shelter front-desk holiday closure"),
+        ("2025-12-25", "Christmas Day 2025", "Shelter front-desk holiday closure"),
+        ("2026-01-01", "New Year's Day 2026", "Shelter front-desk holiday closure"),
+        ("2026-07-04", "Independence Day 2026", "Holiday closure / fireworks evening"),
+        ("2026-07-07", "Post-July 4th Surge 2026 (Tue)", "Post-fireworks stray/ACO impound peak"),
+    ]
+    cal_rows = []
+    for dt_str, event_name, mechanism in holiday_checks:
+        match = daily_counts[daily_counts["intake_local_date"] == dt_str]
+        n_int = int(match["n_intakes"].iloc[0]) if len(match) else 0
+        n_sa = int(match["n_stray_aco"].iloc[0]) if len(match) else 0
+        n_ow = int(match["n_owner"].iloc[0]) if len(match) else 0
+        cal_rows.append({
+            "local_date": dt_str,
+            "calendar_event": event_name,
+            "n_intakes": n_int,
+            "stray_aco_intakes": n_sa,
+            "owner_surrenders": n_ow,
+            "vs_median_day_pct": round(100.0 * (n_int - baseline_daily) / baseline_daily, 1),
+            "operational_interpretation": mechanism,
+        })
+    cal_df = pd.DataFrame(cal_rows)
+    return hourly_df, dow_df, cal_df
+
+
+# ---------------------------------------------------------------------------
+# Section 2.6: Relationship Exploration (Age at Intake vs Length of Stay)
+# ---------------------------------------------------------------------------
+
+def compute_age_los_relationship(con: sqlite3.Connection) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Section 2.6: Explores the relationship between age at intake (`age_at_intake_days`)
+    and `length_of_stay_days` among adopted companion animals (`Cat` and `Dog`).
+    Returns:
+      - raw_pairs_df: stay-level observations for scatter plotting
+      - binned_df: age-binned medians and IQR bounds for Cat vs Dog
+      - corr_sensitivity_df: Pearson r and Spearman rho across full data, driver removals, and subgroups
+    """
+    df = pd.read_sql_query(
+        """
+        SELECT
+            s.animal_key,
+            s.animal_type,
+            s.life_stage,
+            s.intake_type,
+            s.intake_at,
+            s.outcome_at,
+            s.outcome_status,
+            s.date_of_birth,
+            s.length_of_stay_days,
+            s.days_in_shelter_flag,
+            (julianday(substr(s.intake_at, 1, 10)) - julianday(s.date_of_birth)) AS age_days
+        FROM stays_clean_view AS s
+        WHERE s.outcome_at IS NOT NULL
+          AND s.days_in_shelter_flag IN ('ok', 'unusual_high_stay')
+          AND s.stay_sequence_flag = 'ok'
+          AND s.date_of_birth IS NOT NULL
+          AND s.animal_type IN ('Cat', 'Dog')
+        """,
+        con,
+    )
+    df = df[df["age_days"] >= 0].copy()
+    df["age_months"] = df["age_days"] / 30.4375
+    df["intake_month_num"] = pd.to_datetime(df["intake_at"]).dt.month
+    df["is_kitten_season"] = df["intake_month_num"].isin([5, 6, 7, 8])
+
+    adopted = df[df["outcome_status"] == "Adopted"].copy()
+
+    # Age bins for binned median + IQR overlay
+    bin_specs = [
+        (0, 28, "0-4w (<1m)", 0.5),
+        (29, 42, "4-6w (1-1.5m)", 1.25),
+        (43, 56, "6-8w (1.5-2m)", 1.75),
+        (57, 90, "2-3m", 2.5),
+        (91, 180, "3-6m", 4.5),
+        (181, 365, "6-12m", 9.0),
+        (366, 730, "1-2y", 18.0),
+        (731, 1825, "2-5y", 36.0),
+        (1826, 20000, "5y+", 72.0),
+    ]
+    bin_rows = []
+    for sp in ("Cat", "Dog"):
+        sp_sub = adopted[adopted["animal_type"] == sp]
+        for lo, hi, label, mid_m in bin_specs:
+            b = sp_sub[(sp_sub["age_days"] >= lo) & (sp_sub["age_days"] <= hi)]["length_of_stay_days"].dropna()
+            if len(b) > 0:
+                bin_rows.append({
+                    "animal_type": sp,
+                    "age_bin": label,
+                    "mid_age_months": mid_m,
+                    "n": int(len(b)),
+                    "q25_los_d": round(float(b.quantile(0.25)), 2),
+                    "median_los_d": round(float(b.median()), 2),
+                    "q75_los_d": round(float(b.quantile(0.75)), 2),
+                    "mean_los_d": round(float(b.mean()), 2),
+                })
+    binned_df = pd.DataFrame(bin_rows)
+
+    # Pearson vs Spearman sensitivity & driver removal checks
+    cohorts = [
+        ("1. All Adopted Cat + Dog (ok + unusual_high_stay)", adopted),
+        ("2. Remove unusual_high_stay tail (ok only)", adopted[adopted["days_in_shelter_flag"] == "ok"]),
+        ("3. Juvenile Adopted Cats (age <= 180d, all valid)", adopted[(adopted["animal_type"] == "Cat") & (adopted["age_days"] <= 180)]),
+        ("4. Juvenile Adopted Cats — remove <42d neonates", adopted[(adopted["animal_type"] == "Cat") & (adopted["age_days"] >= 42) & (adopted["age_days"] <= 180)]),
+        ("5. Juvenile Adopted Cats — Peak Season (May-Aug)", adopted[(adopted["animal_type"] == "Cat") & (adopted["age_days"] <= 180) & (adopted["is_kitten_season"])]),
+        ("6. Juvenile Adopted Cats — Off-Peak (Sep-Apr)", adopted[(adopted["animal_type"] == "Cat") & (adopted["age_days"] <= 180) & (~adopted["is_kitten_season"])]),
+        ("7. Juvenile Adopted Dogs (age <= 180d, all valid)", adopted[(adopted["animal_type"] == "Dog") & (adopted["age_days"] <= 180)]),
+        ("8. Adult Adopted Cats (age > 180d)", adopted[(adopted["animal_type"] == "Cat") & (adopted["age_days"] > 180)]),
+        ("9. Adult Adopted Dogs (age > 180d)", adopted[(adopted["animal_type"] == "Dog") & (adopted["age_days"] > 180)]),
+    ]
+    corr_rows = []
+    for label, sub in cohorts:
+        rp = float(sub["age_days"].corr(sub["length_of_stay_days"], method="pearson"))
+        rs = float(sub["age_days"].corr(sub["length_of_stay_days"], method="spearman"))
+        corr_rows.append({
+            "subset_check": label,
+            "n": int(len(sub)),
+            "pearson_r": round(rp, 4),
+            "spearman_rho": round(rs, 4),
+            "median_age_d": round(float(sub["age_days"].median()), 1),
+            "median_los_d": round(float(sub["length_of_stay_days"].median()), 2),
+        })
+    corr_df = pd.DataFrame(corr_rows)
+    return adopted, binned_df, corr_df
+
+
+# ---------------------------------------------------------------------------
+# Section 2.7: Focal Comparison, Cluster Bootstrap 95% CI, Composition Check
+#              (Simpson's Paradox), and Candidate Look Count Audit
+# ---------------------------------------------------------------------------
+
+def _cluster_bootstrap_diff(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    value_col: str,
+    cluster_col: str,
+    stat: str = "median",
+    n_boot: int = BOOTSTRAP_ITERATIONS,
+    seed: int = RANDOM_SEED,
+) -> dict[str, float]:
+    """
+    Computes the observed difference (Group A - Group B) and both:
+      1) Cluster-bootstrapped 95% CI (resampling independent `cluster_col` units, e.g. daily intake cohorts)
+      2) Naive row-level bootstrapped 95% CI (assuming every row is independent)
+    """
+    rng = np.random.default_rng(seed)
+
+    vals_a = df_a[value_col].dropna().to_numpy(dtype=float)
+    vals_b = df_b[value_col].dropna().to_numpy(dtype=float)
+    obs_a = float(np.median(vals_a) if stat == "median" else np.mean(vals_a))
+    obs_b = float(np.median(vals_b) if stat == "median" else np.mean(vals_b))
+    obs_diff = obs_a - obs_b
+
+    # Pre-group arrays by cluster unit for fast vectorised cluster bootstrap
+    clusters_a = [g.to_numpy(dtype=float) for _, g in df_a.dropna(subset=[value_col]).groupby(cluster_col)[value_col]]
+    clusters_b = [g.to_numpy(dtype=float) for _, g in df_b.dropna(subset=[value_col]).groupby(cluster_col)[value_col]]
+    n_cl_a = len(clusters_a)
+    n_cl_b = len(clusters_b)
+
+    # Resampling whole clusters with replacement preserves within-day littermate/cohort dependence:
+    cl_sums_a = np.array([c.sum() for c in clusters_a])
+    cl_cnts_a = np.array([len(c) for c in clusters_a])
+    cl_meds_a = np.array([np.median(c) for c in clusters_a])
+
+    cl_sums_b = np.array([c.sum() for c in clusters_b])
+    cl_cnts_b = np.array([len(c) for c in clusters_b])
+    cl_meds_b = np.array([np.median(c) for c in clusters_b])
+
+    idx_cl_a = rng.integers(0, n_cl_a, size=(n_boot, n_cl_a))
+    idx_cl_b = rng.integers(0, n_cl_b, size=(n_boot, n_cl_b))
+
+    if stat == "mean":
+        boot_a_cl = cl_sums_a[idx_cl_a].sum(axis=1) / cl_cnts_a[idx_cl_a].sum(axis=1)
+        boot_b_cl = cl_sums_b[idx_cl_b].sum(axis=1) / cl_cnts_b[idx_cl_b].sum(axis=1)
+    else:
+        # Cluster-unit median bootstrap (resampling daily cohort medians)
+        boot_a_cl = np.median(cl_meds_a[idx_cl_a], axis=1)
+        boot_b_cl = np.median(cl_meds_b[idx_cl_b], axis=1)
+
+    diff_cl = boot_a_cl - boot_b_cl
+    ci_low_cl, ci_high_cl = np.percentile(diff_cl, [2.5, 97.5])
+
+    # Naive row-level bootstrap for comparison
+    n_row_a, n_row_b = len(vals_a), len(vals_b)
+    naive_diffs = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        sa = vals_a[rng.integers(0, n_row_a, size=n_row_a)]
+        sb = vals_b[rng.integers(0, n_row_b, size=n_row_b)]
+        if stat == "mean":
+            naive_diffs[b] = sa.mean() - sb.mean()
+        else:
+            naive_diffs[b] = np.median(sa) - np.median(sb)
+    ci_low_nv, ci_high_nv = np.percentile(naive_diffs, [2.5, 97.5])
+
+    return {
+        "n_rows_a": int(n_row_a),
+        "n_rows_b": int(n_row_b),
+        "n_clusters_a": int(n_cl_a),
+        "n_clusters_b": int(n_cl_b),
+        "estimate_a": round(obs_a, 2),
+        "estimate_b": round(obs_b, 2),
+        "diff_a_minus_b": round(obs_diff, 2),
+        "cluster_ci_low": round(float(ci_low_cl), 2),
+        "cluster_ci_high": round(float(ci_high_cl), 2),
+        "cluster_ci_width": round(float(ci_high_cl - ci_low_cl), 2),
+        "naive_ci_low": round(float(ci_low_nv), 2),
+        "naive_ci_high": round(float(ci_high_nv), 2),
+        "naive_ci_width": round(float(ci_high_nv - ci_low_nv), 2),
+    }
+
+
+def compute_simpsons_paradox_and_intervals(df_time: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Section 2.7: Computes:
+      1) Composition breakdown of Dog vs Cat across life_stage and intake_type
+      2) Cluster-bootstrapped 95% confidence intervals (unit = intake_local_date daily cohort)
+         showing Simpson's paradox in Adoption Share (%) and Length of Stay (days)
+      3) Full audit table of all 12 candidate comparisons inspected (LOOK_COUNT = 12)
+    """
+    comp = df_time[
+        df_time["outcome_at"].notna()
+        & df_time["days_in_shelter_flag"].isin(PRIMARY_FLAG_FILTER)
+        & df_time["animal_type"].isin(["Cat", "Dog"])
+    ].copy()
+    comp["is_adopted_pct"] = (comp["outcome_status"] == "Adopted").astype(float) * 100.0
+
+    # 1. Composition mixture table (why pooled Cat vs Dog is confounded)
+    mix_rows = []
+    for sp in ("Cat", "Dog"):
+        sub = comp[comp["animal_type"] == sp]
+        n_tot = len(sub)
+        mix_rows.append({
+            "species": sp,
+            "n_completed_stays": int(n_tot),
+            "juvenile_share_pct": round(100.0 * (sub["life_stage"] == "juvenile").mean(), 1),
+            "adult_share_pct": round(100.0 * (sub["life_stage"] == "adult").mean(), 1),
+            "community_program_share_pct": round(100.0 * (sub["intake_type"] == "Community Program").mean(), 1),
+            "stray_share_pct": round(100.0 * (sub["intake_type"] == "Stray").mean(), 1),
+            "aco_impound_share_pct": round(100.0 * (sub["intake_type"] == "ACO Impound").mean(), 1),
+            "owner_surrender_share_pct": round(100.0 * (sub["intake_type"] == "Owner Surrender").mean(), 1),
+        })
+    mixture_df = pd.DataFrame(mix_rows)
+
+    # 2. Subgroup comparisons with cluster-bootstrapped 95% CIs (unit = intake_local_date)
+    strata = [
+        (
+            "1. Pooled All Completed Stays (Dog vs Cat)",
+            comp[comp["animal_type"] == "Dog"],
+            comp[comp["animal_type"] == "Cat"],
+        ),
+        (
+            "2. Adult Stays Only (Adult Dog vs Adult Cat)",
+            comp[(comp["animal_type"] == "Dog") & (comp["life_stage"] == "adult")],
+            comp[(comp["animal_type"] == "Cat") & (comp["life_stage"] == "adult")],
+        ),
+        (
+            "3. Juvenile Stays Only (Juvenile Dog vs Juvenile Cat)",
+            comp[(comp["animal_type"] == "Dog") & (comp["life_stage"] == "juvenile")],
+            comp[(comp["animal_type"] == "Cat") & (comp["life_stage"] == "juvenile")],
+        ),
+        (
+            "4. Adult Non-TNR Stays (excl. Community Program)",
+            comp[(comp["animal_type"] == "Dog") & (comp["life_stage"] == "adult") & (comp["intake_type"] != "Community Program")],
+            comp[(comp["animal_type"] == "Cat") & (comp["life_stage"] == "adult") & (comp["intake_type"] != "Community Program")],
+        ),
+        (
+            "5. Intake Channel: Owner Surrender vs Stray (Cat+Dog)",
+            comp[comp["intake_type"] == "Owner Surrender"],
+            comp[comp["intake_type"] == "Stray"],
+        ),
+    ]
+
+    ci_rows = []
+    for label, grp_a, grp_b in strata:
+        los_res = _cluster_bootstrap_diff(
+            grp_a, grp_b, "length_of_stay_days", "intake_local_date", stat="median"
+        )
+        ad_res = _cluster_bootstrap_diff(
+            grp_a, grp_b, "is_adopted_pct", "intake_local_date", stat="mean"
+        )
+        ci_rows.append({
+            "comparison_stratum": label,
+            "n_group_A": los_res["n_rows_a"],
+            "n_group_B": los_res["n_rows_b"],
+            "clusters_A_days": los_res["n_clusters_a"],
+            "clusters_B_days": los_res["n_clusters_b"],
+            "median_los_A_d": los_res["estimate_a"],
+            "median_los_B_d": los_res["estimate_b"],
+            "los_diff_A_minus_B_d": los_res["diff_a_minus_b"],
+            "los_cluster_95ci": f"[{los_res['cluster_ci_low']:+.2f}, {los_res['cluster_ci_high']:+.2f}]",
+            "los_naive_95ci": f"[{los_res['naive_ci_low']:+.2f}, {los_res['naive_ci_high']:+.2f}]",
+            "adopt_A_pct": ad_res["estimate_a"],
+            "adopt_B_pct": ad_res["estimate_b"],
+            "adopt_diff_pct_pt": ad_res["diff_a_minus_b"],
+            "adopt_cluster_95ci": f"[{ad_res['cluster_ci_low']:+.2f}, {ad_res['cluster_ci_high']:+.2f}]",
+        })
+    ci_df = pd.DataFrame(ci_rows)
+
+    # 3. Audit log of all 12 candidate looks inspected during exploration
+    looks_data = [
+        (1, "Dog vs Cat — Pooled Median LOS", "+1.90 d", "Selected (part of focal comparison)"),
+        (2, "Dog vs Cat — Pooled Adoption Share", "-0.1% to -0.9%", "Confounded by juvenile & TNR mixture"),
+        (3, "Adult Dog vs Adult Cat — Adoption Share", "+5.4% to +5.6%", "Selected (Simpson's paradox reversal)"),
+        (4, "Juvenile Dog vs Juvenile Cat — Median LOS", "-0.04 d to -0.11 d", "Selected (juvenile reversal vs adults)"),
+        (5, "Owner Surrender vs Stray — Adoption Share", "+12.1% to +12.5%", "Selected (secondary channel benchmark)"),
+        (6, "ACO Impound vs Stray — Adoption Share", "-21.2%", "Exploratory channel contrast"),
+        (7, "Male vs Female — Median LOS (Cat+Dog)", "-0.35 d", "Small difference; not focal"),
+        (8, "Previously Spayed/Neutered vs Intact at Intake — LOS", "-1.82 d", "Confounded by age at intake"),
+        (9, "Peak Kitten Season (May-Aug) vs Winter (Nov-Feb) — Cat LOS", "+2.10 d", "Seasonal foster backlog"),
+        (10, "Named vs Unnamed at Intake — Adoption Share", "+9.4%", "Proxy for Owner Surrender vs Stray"),
+        (11, "Logged Abnormal Health vs Logged Normal — LOS", "+6.40 d", "Restricted to 16.6% MNAR logged subset"),
+        (12, "Wildlife vs Companion Animals — Same-Day Exit Share", "+68.5%", "Structural triage difference"),
+    ]
+    looks_df = pd.DataFrame(
+        looks_data,
+        columns=["look_index", "candidate_comparison", "observed_contrast", "disposition"],
+    )
+    return mixture_df, ci_df, looks_df
