@@ -4,6 +4,13 @@ requests>=2.31.0
 # Environment variable loader from .env file
 python-dotenv>=1.0.0
 
-# IANA time zone data for zoneinfo (America/Chicago -> UTC), required on Windows
+# IANA time zone data for zoneinfo (America/Chicago <-> UTC), required on Windows
 tzdata>=2024.1
 
+# M3 / M4 exploration, numerical analysis, visualization, and notebook execution
+numpy>=1.26.0
+pandas>=2.1.0
+matplotlib>=3.8.0
+nbformat>=5.9.0
+nbconvert>=7.10.0
+ipykernel>=6.25.0

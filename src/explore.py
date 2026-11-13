@@ -842,7 +842,7 @@ def apply_m4_plot_style() -> None:
 def _add_header_and_caption(fig, title: str, subtitle: str, caption: str) -> None:
     fig.suptitle(title, fontsize=12, fontweight="bold", y=0.98)
     fig.text(0.5, 0.935, subtitle, ha="center", va="top", fontsize=9.5, style="italic", color="#333333")
-    fig.text(0.5, 0.01, caption, ha="center", va="bottom", fontsize=8.0, color="#444444")
+    fig.text(0.5, 0.01, caption, ha="center", va="bottom", fontsize=7.3, color="#444444")
 
 
 def plot_fig1_raw_vs_cleaned_and_rankings(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR) -> Path:
@@ -879,7 +879,8 @@ def plot_fig1_raw_vs_cleaned_and_rankings(con: sqlite3.Connection, out_dir: Path
     ax1.axvline(50.0, color="#d95f02", linestyle="--", linewidth=1.2, label="50% parity benchmark")
     ax1.set_yticks(y_pos)
     ax1.set_yticklabels([c[0] for c in cohorts])
-    ax1.set_xlim(0, 70)
+    ax1.set_xlim(0, 74)
+    ax1.set_ylim(-1.15, 2.55)
     ax1.set_xlabel("Live Adoption Share (% of completed stays)")
     ax1.set_title("A. M3 Subtype Mapping Lifts Measured Adoption Rate by ~4-5 pp")
     ax1.legend(loc="lower right", fontsize=8)
@@ -900,9 +901,10 @@ def plot_fig1_raw_vs_cleaned_and_rankings(con: sqlite3.Connection, out_dir: Path
     ax2.set_yticks(y2)
     ax2.set_yticklabels([f"{r.animal_type} (n={r.n:,})" for _, r in ranks_valid.iterrows()])
     ax2.set_xlim(0, max(175.0, float(ranks_valid["p95_d"].max()) * 1.12))
+    ax2.set_ylim(-1.65, len(ranks_valid) - 0.35)
     ax2.set_xlabel("Length of Stay (days, UTC timestamp difference)")
-    ax2.set_title("B. Group Ranking Reverses Between Median (Small Mammal #1) and p95 (Wildlife/Dog)")
-    ax2.legend(loc="lower right", fontsize=8)
+    ax2.set_title("B. Ranking Reverses: Median (Small Mammal) vs p95 (Wildlife)")
+    ax2.legend(loc="lower right", fontsize=7.8)
 
     n_raw_all = int(rvc.loc[rvc["cohort"] == "M2 Raw — All Outcomes (unfiltered)", "n"].iloc[0])
     n_cln_all = int(rvc.loc[rvc["cohort"] == "M3 Cleaned — All Valid Completed Stays", "n"].iloc[0])
@@ -1110,7 +1112,7 @@ def plot_fig4_time_clock_and_scales(con: sqlite3.Connection, out_dir: Path = FIG
     ax1.plot(hours, hourly_df["pct_stored_utc"], color="#cb181d", linestyle="--", marker="^", linewidth=1.6, label="Stored UTC (unadjusted +5/+6h shift)")
     ax1.set_xticks(range(0, 24, 3))
     ax1.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 3)])
-    ax1.set_ylim(0, max(float(hourly_df["pct_local_chicago"].max()), float(hourly_df["pct_stored_utc"].max())) * 1.15)
+    ax1.set_ylim(0, max(float(hourly_df["pct_local_chicago"].max()), float(hourly_df["pct_stored_utc"].max())) * 1.28)
     ax1.set_xlabel("Hour of Day (00:00-23:00)")
     ax1.set_ylabel("Share of All Intakes (%)")
     ax1.set_title("A. Stored UTC Shifts 11:00-16:00 Local Peak Into Evening")
@@ -1153,7 +1155,7 @@ def plot_fig4_time_clock_and_scales(con: sqlite3.Connection, out_dir: Path = FIG
     ax3.set_ylim(0, max(float(np.nanmax(juv_series)), float(np.nanmax(adt_series))) * 1.18)
     ax3.set_xlabel("Intake Month (America/Chicago; partial edges shown as gaps)")
     ax3.set_ylabel("Monthly Intake Count (animals/month)")
-    ax3.set_title("C. May-July Kitten/Puppy Surge Doubles Juvenile Volume")
+    ax3.set_title("C. May-July Surge Doubles Juvenile Volume")
     ax3.legend(loc="upper right", fontsize=7.5)
 
     _add_header_and_caption(
@@ -1227,7 +1229,7 @@ def plot_fig5_age_vs_los_relationship(con: sqlite3.Connection, out_dir: Path = F
 
         ax.text(
             0.97,
-            0.84,
+            0.70,
             (
                 f"Juvenile (<=6m, n={len(juv):,}):\n"
                 f"  Pearson r = {r_juv_p:+.2f}, Spearman rho = {r_juv_s:+.2f}\n"
@@ -1241,7 +1243,7 @@ def plot_fig5_age_vs_los_relationship(con: sqlite3.Connection, out_dir: Path = F
             bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92},
         )
         ax.set_xlim(-1, 60)
-        ax.set_ylim(0, 90)
+        ax.set_ylim(0, 95)
         ax.set_xlabel("Age at Intake (months, from date_of_birth to intake_at; 0-60m window)")
         ax.set_title(f"{'A' if sp == 'Cat' else 'B'}. Adopted {sp}s: Binned Median & IQR Across Age at Intake")
         ax.legend(loc="upper right", fontsize=7.8)
@@ -1285,10 +1287,10 @@ def plot_fig6_headline_simpsons_paradox(con: sqlite3.Connection, out_dir: Path =
     # Left panel: Grouped bars starting at 0 showing Simpson's paradox in Adoption Share (%)
     strata_rows = ci_df.iloc[:4].copy()
     short_labels = [
-        "1. Pooled (All Stays)\n[Confounded by 60% Cat Juveniles]",
-        "2. Adult Stays Only\n(>180d at intake — Reverses!)",
-        "3. Juvenile Stays Only\n(<=180d at intake)",
-        "4. Adult Non-TNR Stays\n(excl. Community Program)",
+        "1. Pooled (All Stays)\n[60% Cat Juveniles]",
+        "2. Adults Only\n(>180d — Reverses!)",
+        "3. Juveniles Only\n(<=180d at intake)",
+        "4. Adult Non-TNR\n(excl. Comm. Prog.)",
     ]
     x_pos = np.arange(len(strata_rows))
     w = 0.35
@@ -1296,10 +1298,11 @@ def plot_fig6_headline_simpsons_paradox(con: sqlite3.Connection, out_dir: Path =
     b_cat = ax1.bar(x_pos + w / 2, strata_rows["adopt_B_pct"], width=w, color="#1b9e77", label="Cat (Group B)")
     ax1.axhline(50.0, color="#666666", linestyle=":", linewidth=1.1, label="50% adoption reference")
     ax1.set_xticks(x_pos)
-    ax1.set_xticklabels(short_labels, fontsize=8.2)
+    ax1.set_xticklabels(short_labels, fontsize=7.8)
     ax1.set_ylim(0, 72)
     ax1.set_ylabel("Live Adoption Rate (% of completed stays)")
-    ax1.set_title("A. Simpson's Paradox: Adult Dogs Beat Adult Cats (+5.5 pp) Despite Pooled Parity")
+    adult_diff_pp = float(ci_df.iloc[1]["adopt_diff_pct_pt"])
+    ax1.set_title(f"A. Simpson's Paradox: Adult Dogs Beat Adult Cats ({adult_diff_pp:+.1f} pp) Despite Pooled Parity")
     ax1.legend(loc="upper right", fontsize=8)
 
     for bars in (b_dog, b_cat):
@@ -1353,10 +1356,11 @@ def plot_fig6_headline_simpsons_paradox(con: sqlite3.Connection, out_dir: Path =
         "5. Owner Surrender - Stray",
     ], fontsize=8.5)
     ax2.invert_yaxis()
+    ax2.set_ylim(4.85, -0.55)
     ax2.set_xlim(min(-18.0, float(cl_lows.min()) - 4.0), max(20.0, float(cl_highs.max()) + 4.0))
     ax2.set_xlabel("Adoption Rate Difference: Group A minus Group B (percentage points)")
     ax2.set_title(f"B. Cluster-Bootstrapped 95% CIs Across Subgroups (Look Count = {LOOK_COUNT})")
-    ax2.legend(loc="lower right", fontsize=7.8)
+    ax2.legend(loc="lower left", fontsize=7.6)
 
     n_dog = int(ci_df.iloc[0]["n_group_A"])
     n_cat = int(ci_df.iloc[0]["n_group_B"])
@@ -1386,3 +1390,33 @@ def generate_all_m4_figures(con: sqlite3.Connection, out_dir: Path = FIGURES_DIR
         plot_fig5_age_vs_los_relationship(con, out_dir),
         plot_fig6_headline_simpsons_paradox(con, out_dir),
     ]
+
+
+def run_m4_verification() -> None:
+    """CLI verifier for M4 read-only safety, table hash invariance, and figure regeneration."""
+    con = connect_ro()
+    try:
+        ro_ok = verify_readonly_enforcement(con)
+        if not ro_ok:
+            raise RuntimeError("Read-only enforcement check failed!")
+        before = hash_all_tables(con)
+        figs = generate_all_m4_figures(con, FIGURES_DIR)
+        after = hash_all_tables(con)
+        if before != after:
+            raise RuntimeError("Table hashes changed during figure generation!")
+    finally:
+        con.close()
+    print("=" * 72)
+    print("AUSTIN ANIMAL CENTER -- M4 EXPLORATION & REPRODUCIBILITY CHECK")
+    print("=" * 72)
+    print("read_only_mode:  VERIFIED (mode=ro, PRAGMA query_only=ON)")
+    print(f"table_hashes:    UNCHANGED across all {len(after)} tables")
+    print(f"figures_written: {len(figs)} PNG files in {FIGURES_DIR.relative_to(ROOT_DIR)}/")
+    for p in figs:
+        print(f"  - {p.relative_to(ROOT_DIR)} ({p.stat().st_size:,} bytes)")
+    print("STATUS: COMPLETE")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    run_m4_verification()
