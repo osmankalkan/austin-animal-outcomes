@@ -1,12 +1,14 @@
 """
 Socrata Open Data API (SODA) Client for Austin Animal Center datasets.
 Provides authenticated/anonymous HTTP access, error resilience (Section 3.2),
-and pagination ($limit / $offset).
+pagination ($limit / $offset), and incremental window queries ($where).
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import time
-import logging
 import requests
 from dotenv import load_dotenv
 
@@ -18,6 +20,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Catch-up bound per endpoint per run (>2.5x full 18-month dataset size)
+DEFAULT_MAX_RECORDS_PER_RUN = 50000
+
 
 class SodaAuthError(Exception):
     """Raised when authentication or authorization fails (401/403). Non-retryable."""
@@ -25,7 +30,7 @@ class SodaAuthError(Exception):
 
 
 class SodaRequestError(Exception):
-    """Raised when an unrecoverable request or network error occurs."""
+    """Raised when an unrecoverable request, payload, or network error occurs."""
     pass
 
 
@@ -34,15 +39,20 @@ class SodaClient:
 
     def __init__(
         self,
-        app_token: str = None,
-        timeout: int = None,
-        max_retries: int = None,
-        page_limit: int = None
+        app_token: str | None = None,
+        timeout: int | None = None,
+        max_retries: int | None = None,
+        page_limit: int | None = None,
+        max_records_per_run: int | None = None,
     ):
-        self.app_token = (app_token or os.getenv("AUSTIN_APP_TOKEN", "")).strip()
+        env_token = os.getenv("AUSTIN_APP_TOKEN", "")
+        self.app_token = (app_token if app_token is not None else env_token).strip()
         self.timeout = int(timeout or os.getenv("REQUEST_TIMEOUT_SECONDS", 30))
         self.max_retries = int(max_retries or os.getenv("MAX_RETRIES", 5))
         self.page_limit = int(page_limit or os.getenv("PAGE_LIMIT", 1000))
+        self.max_records_per_run = int(
+            max_records_per_run or os.getenv("MAX_RECORDS_PER_RUN", DEFAULT_MAX_RECORDS_PER_RUN)
+        )
 
     def _get_headers(self) -> dict:
         """Constructs headers for SODA API requests."""
@@ -51,13 +61,14 @@ class SodaClient:
             headers["X-App-Token"] = self.app_token
         return headers
 
-    def _make_request(self, url: str, params: dict = None) -> list:
+    def _make_request(self, url: str, params: dict | None = None) -> list:
         """
-        Executes an HTTP GET request with resilience per Section 3.2 rules:
+        Executes an HTTP GET request with resilience per M1/M5 rules:
         - 401/403: Abort immediately, raise SodaAuthError (do NOT retry).
         - 429: Rate limited; wait with exponential backoff (or Retry-After).
         - 5xx: Server errors; wait with exponential backoff and retry.
         - Timeout / ConnectionError: Retry with exponential backoff up to max_retries.
+        - Payload validation: Response must be a JSON list of dict objects.
         """
         headers = self._get_headers()
         params = params or {}
@@ -102,9 +113,20 @@ class SodaClient:
                     logger.error(error_msg)
                     raise SodaRequestError(error_msg)
 
-                # 200 OK: Success
+                # 200 OK: Success -> Validate JSON list payload
                 response.raise_for_status()
-                return response.json()
+                try:
+                    payload = response.json()
+                except ValueError as json_err:
+                    raise SodaRequestError(f"Malformed JSON payload from {url}: {json_err}") from json_err
+
+                if not isinstance(payload, list):
+                    raise SodaRequestError(
+                        f"Unexpected JSON payload type from {url}: expected list, got {type(payload).__name__}"
+                    )
+                if any(not isinstance(item, dict) for item in payload):
+                    raise SodaRequestError(f"Unexpected non-object record in JSON list from {url}.")
+                return payload
 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
                 wait_time = 2 ** attempt
@@ -119,7 +141,7 @@ class SodaClient:
 
         raise SodaRequestError(f"Failed to fetch data from {url} after {self.max_retries} attempts.")
 
-    def get(self, endpoint_url: str, limit: int = None, offset: int = 0, params: dict = None) -> list:
+    def get(self, endpoint_url: str, limit: int | None = None, offset: int = 0, params: dict | None = None) -> list:
         """Fetches a single page of records."""
         req_params = (params.copy() if params else {})
         req_params["$limit"] = limit or self.page_limit
@@ -130,25 +152,30 @@ class SodaClient:
     def fetch_all(
         self,
         endpoint_url: str,
-        params: dict = None,
-        max_records: int = None
+        params: dict | None = None,
+        max_records: int | None = None
     ) -> list:
         """
-        Paginates through the entire SODA dataset using $limit and $offset.
+        Paginates through the SODA dataset using $limit and $offset up to max_records.
         Stops when an empty list is returned or fewer records than limit are received.
         """
         offset = 0
         all_records = []
         base_params = params.copy() if params else {}
+        effective_max = max_records if max_records is not None else self.max_records_per_run
 
-        logger.info(f"Starting pagination for endpoint: {endpoint_url} (page size: {self.page_limit})")
+        logger.info(
+            f"Starting pagination for endpoint: {endpoint_url} (page size: {self.page_limit}, max_records: {effective_max})"
+        )
 
         while True:
             page_params = base_params.copy()
             fetch_count = self.page_limit
 
-            if max_records and (len(all_records) + fetch_count > max_records):
-                fetch_count = max_records - len(all_records)
+            if effective_max and (len(all_records) + fetch_count > effective_max):
+                fetch_count = effective_max - len(all_records)
+                if fetch_count <= 0:
+                    break
 
             page_params["$limit"] = fetch_count
             page_params["$offset"] = offset
@@ -156,26 +183,47 @@ class SodaClient:
 
             records = self._make_request(endpoint_url, params=page_params)
 
-            # Boş yanıt kontrolü (Empty response detection)
-            if not records or len(records) == 0:
-                logger.info("Empty response received. Pagination completed.")
+            if not records:
+                logger.info("Empty page received. Pagination completed.")
                 break
 
             all_records.extend(records)
             logger.info(f"Fetched {len(records)} records (running total: {len(all_records)})...")
 
             if len(records) < fetch_count:
-                logger.info("Dataset fully consumed (fewer records returned than page limit).")
+                logger.info("Dataset window fully consumed (fewer records returned than page limit).")
                 break
 
             offset += len(records)
 
-            if max_records and len(all_records) >= max_records:
-                logger.info(f"Reached requested limit of {max_records} records.")
+            if effective_max and len(all_records) >= effective_max:
+                logger.info(f"Reached catch-up cap of {effective_max} records.")
                 break
 
         logger.info(f"Total retrieved records: {len(all_records)}")
         return all_records
+
+    def fetch_incremental(
+        self,
+        endpoint_url: str,
+        timestamp_field: str,
+        start_local_iso: str,
+        end_local_iso: str,
+        max_records: int | None = None,
+    ) -> list:
+        """
+        Queries a Socrata SODA endpoint incrementally for records whose floating local
+        timestamp (`source_date` or `outcome_date`) falls within [start_local_iso, end_local_iso].
+        """
+        where_clause = (
+            f"{timestamp_field} >= '{start_local_iso}' AND {timestamp_field} <= '{end_local_iso}'"
+        )
+        params = {
+            "$where": where_clause,
+            "$order": f"{timestamp_field} ASC, :id ASC",
+        }
+        logger.info(f"Incremental query on {timestamp_field}: $where=\"{where_clause}\"")
+        return self.fetch_all(endpoint_url, params=params, max_records=max_records)
 
 
 if __name__ == "__main__":
