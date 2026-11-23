@@ -10,6 +10,7 @@ Runs 7 data quality checks (3 STOP, 4 WARN) against the cleaned SQLite layer.
 
 from __future__ import annotations
 
+import argparse
 from datetime import date, timedelta
 from pathlib import Path
 import shutil
@@ -29,8 +30,9 @@ from src.clean_config import (  # noqa: E402
     MAX_VALID_DATE,
     TEXAS_ZIP_PREFIXES,
 )
+from src.db import connect, get_db_path, get_run_time  # noqa: E402
 
-DB_PATH = PROJECT_ROOT / "data" / "austin_animals.db"
+DB_PATH = get_db_path()
 
 
 class CheckResult:
@@ -78,13 +80,14 @@ def check_stop_1_row_parity(conn: sqlite3.Connection) -> CheckResult:
     )
 
 
-def check_stop_2_zero_invalid_values(conn: sqlite3.Connection) -> CheckResult:
+def check_stop_2_zero_invalid_values(conn: sqlite3.Connection, run_time: str | None = None) -> CheckResult:
     """STOP 2: Zero impossible or uncleaned sentinel values survive in cleaned columns."""
+    run_date = get_run_time(run_time)[:10]
     max_ret_date = conn.execute(
         "SELECT COALESCE(MAX(substr(retrieved_at, 1, 10)), ?) FROM animals_clean",
         (MAX_VALID_DATE,),
     ).fetchone()[0]
-    effective_max_date = max(MAX_VALID_DATE, max_ret_date)
+    effective_max_date = max(MAX_VALID_DATE, run_date, max_ret_date)
     future_dob = conn.execute(
         "SELECT COUNT(*) FROM animals_clean WHERE date_of_birth IS NOT NULL AND date_of_birth > ?",
         (effective_max_date,),
@@ -362,13 +365,19 @@ def check_warn_4_clinical_cross_field_conflicts(conn: sqlite3.Connection) -> Che
     )
 
 
-def run_validation_suite(db_path: Path = DB_PATH, quiet: bool = False) -> tuple[int, list[CheckResult]]:
+def run_validation_suite(
+    db_path: Path | None = None,
+    quiet: bool = False,
+    run_time: str | None = None,
+) -> tuple[int, list[CheckResult]]:
     """Run all 7 checks on db_path and return (exit_code, results)."""
-    conn = sqlite3.connect(db_path)
+    resolved_path = Path(db_path) if db_path is not None else get_db_path()
+    resolved_run_time = get_run_time(run_time)
+    conn = connect(resolved_path, create=False)
     try:
         results = [
             check_stop_1_row_parity(conn),
-            check_stop_2_zero_invalid_values(conn),
+            check_stop_2_zero_invalid_values(conn, run_time=resolved_run_time),
             check_stop_3_fk_and_strict_integrity(conn),
             check_warn_1_dob_missing_by_species(conn),
             check_warn_2_freshness_by_species(conn),
@@ -387,6 +396,7 @@ def run_validation_suite(db_path: Path = DB_PATH, quiet: bool = False) -> tuple[
         print("=" * 72)
         print("AUSTIN ANIMAL CENTER -- M3 DATA QUALITY VALIDATION REPORT")
         print("=" * 72)
+        print(f"database: {resolved_path} | run_time: {resolved_run_time}")
         for r in results:
             print(f"[{r.status:<4}] {r.check_id} ({r.level}): {r.title}")
             print(f"       -> {r.detail}")
@@ -463,12 +473,30 @@ def test_stop_checks_on_temp_copy(db_path: Path = DB_PATH) -> bool:
 
 
 def main() -> int:
-    exit_code, _ = run_validation_suite(DB_PATH, quiet=False)
-    if "--test-stops" in sys.argv:
-        ok = test_stop_checks_on_temp_copy(DB_PATH)
-        if not ok:
-            return 1
-    return exit_code
+    parser = argparse.ArgumentParser(description="Run M3/M5 automated data quality validation checks.")
+    parser.add_argument(
+        "--run-time",
+        default=None,
+        help="Optional ISO 8601 UTC pipeline run timestamp (defaults to PIPELINE_RUN_TIME or current UTC).",
+    )
+    parser.add_argument(
+        "--test-stops",
+        action="store_true",
+        help="Verify on temporary database copies that all 3 STOP checks reliably trigger.",
+    )
+    args = parser.parse_args()
+    try:
+        resolved_rt = get_run_time(args.run_time)
+        db_path = get_db_path()
+        exit_code, _ = run_validation_suite(db_path, quiet=False, run_time=resolved_rt)
+        if args.test_stops:
+            ok = test_stop_checks_on_temp_copy(db_path)
+            if not ok:
+                return 1
+        return exit_code
+    except (FileNotFoundError, ValueError, sqlite3.Error) as exc:
+        print(f"VALIDATION FAILED: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
