@@ -29,3 +29,8 @@ data/*.db
 *.db-wal
 *.db-shm
 
+# M5 automated pipeline runtime artifacts (run log, lock file, scheduled logs)
+data/pipeline_log.db
+data/pipeline.lock
+logs/
+
