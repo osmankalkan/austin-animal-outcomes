@@ -14,6 +14,7 @@ Rules enforced:
 - Every value reaches SQL through a placeholder.
 """
 
+import argparse
 import csv
 import hashlib
 import re
@@ -42,7 +43,7 @@ from src.clean_config import (
     PLACEHOLDER_NAMES,
     TEXAS_ZIP_PREFIXES,
 )
-from src.db import DUMP_SQL, TABLES as M2_TABLES, connect, get_db_path
+from src.db import DUMP_SQL, TABLES as M2_TABLES, connect, get_db_path, get_run_time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -215,10 +216,11 @@ def days_between_iso(ts_start: str, ts_end: str) -> float:
     return (dt_end - dt_start).total_seconds() / 86400.0
 
 
-def build_cleaned_layer(con: sqlite3.Connection, mappings: dict) -> dict:
+def build_cleaned_layer(con: sqlite3.Connection, mappings: dict, run_time: str | None = None) -> dict:
     type_map = mappings["animal_type"]
     intake_map = mappings["intake_type"]
     outcome_map = mappings["outcome_status"]
+    run_date = get_run_time(run_time)[:10]
 
     raw_animals = con.execute(
         """
@@ -295,7 +297,7 @@ def build_cleaned_layer(con: sqlite3.Connection, mappings: dict) -> dict:
         # 1b. date_of_birth rules (Order: missing -> future -> after first intake -> ok)
         first_ia = first_intake_by_animal.get(ak)
         first_ia_date = first_ia[:10] if first_ia else None
-        effective_max_date = max(MAX_VALID_DATE, ret_at[:10]) if ret_at else MAX_VALID_DATE
+        effective_max_date = max(MAX_VALID_DATE, run_date, ret_at[:10] if ret_at else MAX_VALID_DATE)
         if dob_raw is None:
             dob_clean, dob_flag = None, "missing_not_recorded"
         elif dob_raw > effective_max_date:
@@ -587,20 +589,22 @@ def write_cleaned_tables(con: sqlite3.Connection, built: dict) -> None:
     con.executemany(INSERT_OUTCOMES_CLEAN, built["outcomes_clean"])
 
 
-def run_clean(db_path=None, quiet=False) -> dict:
+def run_clean(db_path=None, quiet=False, run_time: str | None = None) -> dict:
     path = Path(db_path) if db_path else get_db_path()
-    if not path.exists():
-        raise CleanError(f"Database not found at {path}. Run `python src/load.py` first.")
+    resolved_run_time = get_run_time(run_time)
 
     started = time.time()
-    con = connect(path)
+    try:
+        con = connect(path)
+    except FileNotFoundError as exc:
+        raise CleanError(str(exc)) from exc
     try:
         apply_clean_schema(con)
         hashes_before = hash_m2_tables(con)
 
         with con:  # single atomic transaction for mappings + all cleaned tables
             mappings = load_mappings(con)
-            built = build_cleaned_layer(con, mappings)
+            built = build_cleaned_layer(con, mappings, run_time=resolved_run_time)
             write_cleaned_tables(con, built)
             violations = con.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
@@ -614,6 +618,7 @@ def run_clean(db_path=None, quiet=False) -> dict:
 
     summary = {
         "db_path": path,
+        "run_time": resolved_run_time,
         "raw_counts": {t: hashes_after[t][0] for t in M2_TABLES},
         "m2_hashes_identical": hashes_before == hashes_after,
         "mappings": mappings,
@@ -641,6 +646,7 @@ def print_summary(s: dict) -> None:
     print("Austin Animal Center - M3 Data Cleaning Summary")
     print("=" * 72)
     print(f"database:        {s['db_path']}")
+    print(f"run_time:        {s['run_time']}")
     print(f"M2 raw tables:   UNTOUCHED (SHA-256 hashes verified before & after: {s['m2_hashes_identical']})")
     print("-" * 72)
 
@@ -696,8 +702,16 @@ def print_summary(s: dict) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build M3 cleaned layer from M2 database tables.")
+    parser.add_argument(
+        "--run-time",
+        default=None,
+        help="Optional ISO 8601 UTC pipeline run timestamp (defaults to PIPELINE_RUN_TIME or current UTC).",
+    )
+    args = parser.parse_args()
     try:
-        run_clean()
+        resolved_rt = get_run_time(args.run_time)
+        run_clean(run_time=resolved_rt)
     except Exception as exc:
         print(f"CLEAN FAILED: {exc}")
         print("STATUS: FAILED")

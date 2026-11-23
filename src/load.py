@@ -11,6 +11,7 @@ M2 loader: builds the SQLite database from the landed raw files.
 - Routes records it cannot load to the quarantine table, never drops them.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -24,7 +25,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.db import apply_schema, connect, get_db_path, table_counts
+from src.db import apply_schema, connect, get_db_path, get_run_time, table_counts
 from src.transform import (
     CleanLog,
     clean_text,
@@ -242,7 +243,7 @@ ON CONFLICT (animal_id) DO UPDATE SET
     secondary_color = excluded.secondary_color,
     date_of_birth   = excluded.date_of_birth,
     retrieved_at    = excluded.retrieved_at
-WHERE excluded.retrieved_at >= animals.retrieved_at
+WHERE excluded.retrieved_at > animals.retrieved_at
 """
 
 UPSERT_INTAKE = """
@@ -259,7 +260,7 @@ ON CONFLICT (animal_key, intake_at) DO UPDATE SET
     intake_health_condition    = excluded.intake_health_condition,
     found_zip                  = excluded.found_zip,
     retrieved_at               = excluded.retrieved_at
-WHERE excluded.retrieved_at >= intakes.retrieved_at
+WHERE excluded.retrieved_at > intakes.retrieved_at
 """
 
 UPSERT_OUTCOME = """
@@ -276,7 +277,7 @@ ON CONFLICT (animal_key, outcome_at) DO UPDATE SET
     spayed_neutered   = excluded.spayed_neutered,
     days_in_shelter   = excluded.days_in_shelter,
     retrieved_at      = excluded.retrieved_at
-WHERE excluded.retrieved_at >= outcomes.retrieved_at
+WHERE excluded.retrieved_at > outcomes.retrieved_at
 """
 
 UPSERT_QUARANTINE = """
@@ -286,7 +287,7 @@ ON CONFLICT (source, source_record_id) DO UPDATE SET
     reason       = excluded.reason,
     raw_record   = excluded.raw_record,
     retrieved_at = excluded.retrieved_at
-WHERE excluded.retrieved_at >= quarantine.retrieved_at
+WHERE excluded.retrieved_at > quarantine.retrieved_at
 """
 
 DELETE_RESOLVED = "DELETE FROM quarantine WHERE source = :source AND source_record_id = :source_record_id"
@@ -360,13 +361,14 @@ def write_all(con, prepared: dict) -> dict:
 # 4. Run + summary
 # ---------------------------------------------------------------------------
 
-def run_load(db_path=None, raw_dir=None, quiet=False) -> dict:
+def run_load(db_path=None, raw_dir=None, quiet=False, run_time: str | None = None) -> dict:
     """Builds/updates the database from raw files. Raises LoadError if nothing could be written."""
     db_path = Path(db_path) if db_path else get_db_path()
     raw_dir = Path(raw_dir) if raw_dir else get_raw_dir()
+    resolved_run_time = get_run_time(run_time)
     started = time.time()
 
-    con = connect(db_path)
+    con = connect(db_path, create=True)
     try:
         apply_schema(con)
         before = table_counts(con)
@@ -385,6 +387,7 @@ def run_load(db_path=None, raw_dir=None, quiet=False) -> dict:
 
     summary = {
         "db_path": db_path,
+        "run_time": resolved_run_time,
         "file_info": file_info,
         "before": before,
         "after": after,
@@ -416,6 +419,7 @@ def print_summary(s: dict) -> None:
     print("Austin Animal Center - M2 database load")
     print("=" * 64)
     print(f"database:              {s['db_path']}")
+    print(f"run_time:              {s['run_time']}")
     print(f"files read:            {n_files} raw files ({per_source}; {span})")
     if info["skipped"]:
         print(f"files skipped:         {len(info['skipped'])} (no UTC timestamp in name)")
@@ -434,9 +438,17 @@ def print_summary(s: dict) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build/update SQLite database from landed raw files.")
+    parser.add_argument(
+        "--run-time",
+        default=None,
+        help="Optional ISO 8601 UTC pipeline run timestamp (defaults to PIPELINE_RUN_TIME or current UTC).",
+    )
+    args = parser.parse_args()
     try:
-        summary = run_load()
-    except LoadError as exc:
+        resolved_rt = get_run_time(args.run_time)
+        summary = run_load(run_time=resolved_rt)
+    except (LoadError, ValueError) as exc:
         print(f"LOAD FAILED: {exc}")
         print("STATUS: FAILED (transaction rolled back, nothing from this run was written)")
         sys.exit(1)
