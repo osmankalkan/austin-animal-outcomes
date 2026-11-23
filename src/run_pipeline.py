@@ -250,7 +250,7 @@ def run_pipeline(
 
             try:
                 proc = subprocess.run(
-                    [sys.executable, str(script_path)],
+                    [sys.executable, str(script_path), "--run-time", run_time],
                     cwd=str(ROOT_DIR),
                     env=child_env,
                     capture_output=True,

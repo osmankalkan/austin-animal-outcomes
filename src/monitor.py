@@ -286,19 +286,37 @@ def run_monitor(
     now_iso: str,
     log_db_path: Path = DEFAULT_LOG_DB,
     data_db_path: Path = DEFAULT_DATA_DB,
+    log_file: Path | None = None,
 ) -> int:
     """Runs all 4 read-only monitor checks and returns 0 (all PASS) or 1 (any ALARM)."""
+    output_lines: list[str] = []
+
+    def emit_line(msg: str) -> None:
+        print(msg)
+        output_lines.append(msg)
+
+    def flush_log() -> None:
+        if log_file is None:
+            return
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"=== monitor run_now={now_iso} ===\n")
+            for ln in output_lines:
+                fh.write(ln + "\n")
+
     try:
         log_con = connect_readonly(log_db_path)
     except (FileNotFoundError, sqlite3.Error) as exc:
-        print(f"[ALARM] monitor_init: cannot open log DB read-only ({exc})")
+        emit_line(f"[ALARM] monitor_init: cannot open log DB read-only ({exc})")
+        flush_log()
         return 1
 
     try:
         data_con = connect_readonly(data_db_path)
     except (FileNotFoundError, sqlite3.Error) as exc:
         log_con.close()
-        print(f"[ALARM] monitor_init: cannot open data DB read-only ({exc})")
+        emit_line(f"[ALARM] monitor_init: cannot open data DB read-only ({exc})")
+        flush_log()
         return 1
 
     try:
@@ -314,10 +332,11 @@ def run_monitor(
 
     alarms = 0
     for name, status, detail in checks:
-        print(f"[{status:<5}] {name}: {detail}")
+        emit_line(f"[{status:<5}] {name}: {detail}")
         if status == "ALARM":
             alarms += 1
 
+    flush_log()
     return 1 if alarms > 0 else 0
 
 
@@ -340,6 +359,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_DATA_DB),
         help="Path to austin_animals.db (opened strictly read-only).",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional path to append monitor output (e.g. logs/monitor.log for scheduled runs).",
+    )
     return parser
 
 
@@ -351,7 +375,13 @@ def main() -> int:
     except ValueError as exc:
         print(f"[ALARM] invalid --now: {exc}")
         return 1
-    return run_monitor(now_iso=now_iso, log_db_path=Path(args.log_db), data_db_path=Path(args.data_db))
+    log_file = Path(args.log_file) if args.log_file else None
+    return run_monitor(
+        now_iso=now_iso,
+        log_db_path=Path(args.log_db),
+        data_db_path=Path(args.data_db),
+        log_file=log_file,
+    )
 
 
 if __name__ == "__main__":
