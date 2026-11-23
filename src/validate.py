@@ -1,20 +1,25 @@
 """
-Milestone M3 — Automated Data Quality Validation Suite.
+Milestone M3 & M5 — Automated Data Quality Validation Suite (`src/validate.py`).
 
-Runs 7 data quality checks (3 STOP, 4 WARN) against the cleaned SQLite layer.
-- Exits 0 when all checks are PASS or WARN.
-- Exits 1 when any check is STOP.
-- Pass `--test-stops` to verify on a temporary database copy that every STOP
-  check reliably triggers and returns a non-zero exit code when broken.
+Runs 8 data quality checks (3 STOP, 2 operational WARN, 3 regression-guarded INFO/WARN)
+against the cleaned SQLite layer using the shared pipeline clock (`--run-time` ->
+`PIPELINE_RUN_TIME` -> current UTC):
+- Exits 0 when all checks are PASS, INFO, or WARN.
+- Exits 1 when any check is STOP (or if the database is missing/unreadable).
+- Healthy scheduled runs produce STOP=0 and WARN=0 (historical structural M3
+  observations are logged as INFO unless they regress past alert thresholds).
+- Pass `--test-stops` to verify on temporary database copies that every STOP
+  check reliably triggers and returns exit_code=1 when broken.
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import sqlite3
+import statistics
 import sys
 import tempfile
 
@@ -23,16 +28,45 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.clean_config import (  # noqa: E402
-    FRESHNESS_WINDOW_DAYS,
     MAX_CORE_DOB_MISSING_SHARE,
-    MAX_EXPECTED_DUPLICATE_EXITS,
     MAX_OVERALL_DOB_MISSING_SHARE,
     MAX_VALID_DATE,
     TEXAS_ZIP_PREFIXES,
 )
 from src.db import connect, get_db_path, get_run_time  # noqa: E402
 
-DB_PATH = get_db_path()
+# ---------------------------------------------------------------------------
+# M5 Operational Validation Thresholds (justified in docs/pipeline.md)
+# ---------------------------------------------------------------------------
+# Austin Animal Center portal updates daily; a feed or core species older than
+# 48 hours relative to `run_time` indicates an upstream stall or broken ingestion.
+MAX_FEED_FRESHNESS_HOURS = 48.0
+
+# Core companion species expected to record arrivals every day (unlike rare
+# Livestock/Other groups, which can legitimately have zero arrivals for weeks).
+CORE_SPECIES = ("Cat", "Dog")
+
+# Volume check window and multiplier: compare trailing 24h event volume ending
+# at `run_time` against the trailing 30-day median daily volume; warn on 0 or >10x.
+VOLUME_LOOKBACK_DAYS = 30
+VOLUME_WINDOW_HOURS = 24.0
+VOLUME_MAX_MULTIPLIER = 10.0
+
+# Regression thresholds for historical M3 structural anomalies (below these
+# thresholds, known source quirks are reported as INFO rather than permanent WARNs).
+MAX_DUPLICATE_EXIT_SHARE = 0.01     # 1.0% of outcomes (baseline ~0.34%)
+MAX_SEQUENCE_ANOMALY_SHARE = 0.005  # 0.5% of intakes (baseline ~0.07%)
+MAX_CLINICAL_CONFLICT_SHARE = 0.02  # 2.0% of outcomes (baseline ~0.86%)
+
+
+def _parse_utc_iso(ts_iso: str) -> datetime:
+    cleaned = ts_iso.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    dt = datetime.fromisoformat(cleaned)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class CheckResult:
@@ -41,8 +75,8 @@ class CheckResult:
     def __init__(self, check_id: str, title: str, level: str, status: str, detail: str) -> None:
         self.check_id = check_id
         self.title = title
-        self.level = level      # "STOP" or "WARN"
-        self.status = status    # "PASS", "WARN", or "STOP"
+        self.level = level      # "STOP", "WARN", or "INFO"
+        self.status = status    # "PASS", "INFO", "WARN", or "STOP"
         self.detail = detail
 
 
@@ -207,8 +241,168 @@ def check_stop_3_fk_and_strict_integrity(conn: sqlite3.Connection) -> CheckResul
     )
 
 
-def check_warn_1_dob_missing_by_species(conn: sqlite3.Connection) -> CheckResult:
-    """WARN 1: Missing date_of_birth share per canonical species."""
+def check_warn_freshness_from_run_time(conn: sqlite3.Connection, run_time: str) -> CheckResult:
+    """
+    WARN 1 (M5): Run-time freshness check for whole feed (intakes + outcomes)
+    and per core companion species (Cat, Dog) measured against `run_time`.
+    """
+    rt_dt = _parse_utc_iso(run_time)
+    max_intake = conn.execute(
+        "SELECT MAX(intake_at) FROM intakes_clean WHERE intake_at <= ?",
+        (run_time,),
+    ).fetchone()[0]
+    max_outcome = conn.execute(
+        "SELECT MAX(outcome_at) FROM outcomes_clean WHERE outcome_at <= ?",
+        (run_time,),
+    ).fetchone()[0]
+
+    species_rows = conn.execute(
+        """
+        SELECT a.animal_type, MAX(i.intake_at) AS latest_intake
+        FROM intakes_clean i
+        JOIN animals_clean a ON a.animal_key = i.animal_key
+        WHERE a.animal_type IN (?, ?)
+          AND i.intake_at <= ?
+        GROUP BY a.animal_type
+        """,
+        (CORE_SPECIES[0], CORE_SPECIES[1], run_time),
+    ).fetchall()
+    species_latest = {sp: ts for sp, ts in species_rows}
+
+    stale_parts = []
+    lag_summary = []
+
+    for label, ts in (("intakes", max_intake), ("outcomes", max_outcome)):
+        if not ts:
+            stale_parts.append(f"{label}=MISSING")
+        else:
+            lag_h = (rt_dt - _parse_utc_iso(ts)).total_seconds() / 3600.0
+            lag_summary.append(f"{label}={lag_h:.1f}h")
+            if lag_h > MAX_FEED_FRESHNESS_HOURS:
+                stale_parts.append(f"{label} lag {lag_h:.1f}h > {MAX_FEED_FRESHNESS_HOURS:.0f}h (latest={ts})")
+
+    for sp in CORE_SPECIES:
+        ts = species_latest.get(sp)
+        if not ts:
+            stale_parts.append(f"{sp}=MISSING")
+        else:
+            lag_h = (rt_dt - _parse_utc_iso(ts)).total_seconds() / 3600.0
+            lag_summary.append(f"{sp}={lag_h:.1f}h")
+            if lag_h > MAX_FEED_FRESHNESS_HOURS:
+                stale_parts.append(f"{sp} lag {lag_h:.1f}h > {MAX_FEED_FRESHNESS_HOURS:.0f}h (latest={ts})")
+
+    if stale_parts:
+        return CheckResult(
+            "WARN-1",
+            f"Run-time freshness (whole feed & core species within {MAX_FEED_FRESHNESS_HOURS:.0f}h of run_time)",
+            "WARN",
+            "WARN",
+            "Stale relative to run_time=" + run_time + ": " + "; ".join(stale_parts),
+        )
+    return CheckResult(
+        "WARN-1",
+        f"Run-time freshness (whole feed & core species within {MAX_FEED_FRESHNESS_HOURS:.0f}h of run_time)",
+        "WARN",
+        "PASS",
+        f"Fresh relative to {run_time}: " + ", ".join(lag_summary),
+    )
+
+
+def check_warn_volume_anomaly(conn: sqlite3.Connection, run_time: str) -> CheckResult:
+    """
+    WARN 2 (M5): Volume check comparing recent 24h intake & outcome volume
+    (ending at `run_time`) against the trailing 30-day median daily volume.
+    Warns if recent volume is 0 or > 10x typical daily volume.
+    Skips cleanly with PASS/INFO if the database is a static rebuild whose
+    latest retrieved_at is older than `run_time` by more than 48h.
+    """
+    rt_dt = _parse_utc_iso(run_time)
+    window_start = (rt_dt - timedelta(hours=VOLUME_WINDOW_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lookback_start_date = (rt_dt - timedelta(days=VOLUME_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    run_date = rt_dt.strftime("%Y-%m-%d")
+
+    max_ret = conn.execute(
+        "SELECT MAX(retrieved_at) FROM intakes_clean"
+    ).fetchone()[0]
+    if max_ret:
+        ret_lag_h = (rt_dt - _parse_utc_iso(max_ret)).total_seconds() / 3600.0
+        if ret_lag_h > MAX_FEED_FRESHNESS_HOURS:
+            return CheckResult(
+                "WARN-2",
+                f"Recent 24h intake/outcome volume vs {VOLUME_LOOKBACK_DAYS}d median daily baseline",
+                "WARN",
+                "INFO",
+                f"Static rebuild detected (latest retrieved_at={max_ret} is {ret_lag_h:.1f}h before run_time); volume check skipped",
+            )
+
+    daily_intake_rows = conn.execute(
+        """
+        SELECT substr(intake_at, 1, 10) AS d, COUNT(*) AS n
+        FROM intakes_clean
+        WHERE substr(intake_at, 1, 10) >= ?
+          AND substr(intake_at, 1, 10) < ?
+        GROUP BY d
+        """,
+        (lookback_start_date, run_date),
+    ).fetchall()
+    daily_outcome_rows = conn.execute(
+        """
+        SELECT substr(outcome_at, 1, 10) AS d, COUNT(*) AS n
+        FROM outcomes_clean
+        WHERE substr(outcome_at, 1, 10) >= ?
+          AND substr(outcome_at, 1, 10) < ?
+        GROUP BY d
+        """,
+        (lookback_start_date, run_date),
+    ).fetchall()
+
+    recent_intakes = conn.execute(
+        "SELECT COUNT(*) FROM intakes_clean WHERE intake_at > ? AND intake_at <= ?",
+        (window_start, run_time),
+    ).fetchone()[0]
+    recent_outcomes = conn.execute(
+        "SELECT COUNT(*) FROM outcomes_clean WHERE outcome_at > ? AND outcome_at <= ?",
+        (window_start, run_time),
+    ).fetchone()[0]
+
+    med_intakes = statistics.median([n for _, n in daily_intake_rows]) if daily_intake_rows else 0.0
+    med_outcomes = statistics.median([n for _, n in daily_outcome_rows]) if daily_outcome_rows else 0.0
+
+    anomalies = []
+    if recent_intakes == 0:
+        anomalies.append(f"intakes_24h=0 (median={med_intakes:.1f}/d)")
+    elif med_intakes > 0 and recent_intakes > VOLUME_MAX_MULTIPLIER * med_intakes:
+        anomalies.append(f"intakes_24h={recent_intakes} > {VOLUME_MAX_MULTIPLIER:.0f}x median ({med_intakes:.1f}/d)")
+
+    if recent_outcomes == 0:
+        anomalies.append(f"outcomes_24h=0 (median={med_outcomes:.1f}/d)")
+    elif med_outcomes > 0 and recent_outcomes > VOLUME_MAX_MULTIPLIER * med_outcomes:
+        anomalies.append(f"outcomes_24h={recent_outcomes} > {VOLUME_MAX_MULTIPLIER:.0f}x median ({med_outcomes:.1f}/d)")
+
+    if anomalies:
+        return CheckResult(
+            "WARN-2",
+            f"Recent 24h intake/outcome volume vs {VOLUME_LOOKBACK_DAYS}d median daily baseline",
+            "WARN",
+            "WARN",
+            "Volume anomaly detected: " + "; ".join(anomalies),
+        )
+    return CheckResult(
+        "WARN-2",
+        f"Recent 24h intake/outcome volume vs {VOLUME_LOOKBACK_DAYS}d median daily baseline",
+        "WARN",
+        "PASS",
+        f"intakes_24h={recent_intakes} (30d median={med_intakes:.1f}/d), "
+        f"outcomes_24h={recent_outcomes} (30d median={med_outcomes:.1f}/d)",
+    )
+
+
+def check_info_1_dob_missing_by_species(conn: sqlite3.Connection) -> CheckResult:
+    """
+    INFO 1 (regression-guarded): Missing date_of_birth share per canonical species.
+    Raises WARN only if core companion species (Cat, Dog) exceed MAX_CORE_DOB_MISSING_SHARE (10%);
+    expected non-companion MAR missingness is reported as INFO (not a permanent WARN).
+    """
     rows = conn.execute(
         """
         SELECT
@@ -222,88 +416,44 @@ def check_warn_1_dob_missing_by_species(conn: sqlite3.Connection) -> CheckResult
     ).fetchall()
 
     core_breaches = []
-    high_missing_groups = []
+    non_companion_mar = []
     for species, total, n_null in rows:
         share = n_null / total if total else 0.0
-        if species in ("Cat", "Dog") and share > MAX_CORE_DOB_MISSING_SHARE:
+        if species in CORE_SPECIES and share > MAX_CORE_DOB_MISSING_SHARE:
             core_breaches.append(f"{species}={share:.1%}")
-        elif share > MAX_OVERALL_DOB_MISSING_SHARE:
-            high_missing_groups.append(f"{species}={share:.1%} ({n_null}/{total})")
+        elif species not in CORE_SPECIES and share > MAX_OVERALL_DOB_MISSING_SHARE:
+            non_companion_mar.append(f"{species}={share:.1%} ({n_null}/{total})")
 
-    if core_breaches or high_missing_groups:
-        msg_parts = []
-        if core_breaches:
-            msg_parts.append(f"Core species >{MAX_CORE_DOB_MISSING_SHARE:.0%}: {', '.join(core_breaches)}")
-        if high_missing_groups:
-            msg_parts.append(
-                f"Non-companion groups >{MAX_OVERALL_DOB_MISSING_SHARE:.0%} (MAR): {', '.join(high_missing_groups)}"
-            )
+    if core_breaches:
         return CheckResult(
-            "WARN-1",
+            "INFO-1",
             "Missing date_of_birth share by canonical species",
             "WARN",
             "WARN",
-            "; ".join(msg_parts),
+            f"Core species >{MAX_CORE_DOB_MISSING_SHARE:.0%}: {', '.join(core_breaches)}",
         )
-    return CheckResult(
-        "WARN-1",
-        "Missing date_of_birth share by canonical species",
-        "WARN",
-        "PASS",
-        "All species below missingness warning thresholds",
-    )
-
-
-def check_warn_2_freshness_by_species(conn: sqlite3.Connection) -> CheckResult:
-    """WARN 2: Freshness check — canonical species presence in the final 7-day window."""
-    latest_intake_date = conn.execute(
-        "SELECT COALESCE(MAX(substr(intake_at, 1, 10)), ?) FROM intakes_clean",
-        (MAX_VALID_DATE,),
-    ).fetchone()[0]
-    cutoff_date = (
-        date.fromisoformat(latest_intake_date) - timedelta(days=FRESHNESS_WINDOW_DAYS)
-    ).isoformat()
-
-    rows = conn.execute(
-        """
-        SELECT
-            a.animal_type,
-            COUNT(*) AS total_intakes,
-            SUM(CASE WHEN substr(i.intake_at, 1, 10) >= ? THEN 1 ELSE 0 END) AS recent_intakes,
-            MAX(substr(i.intake_at, 1, 10)) AS latest_intake
-        FROM intakes_clean i
-        JOIN animals_clean a ON a.animal_key = i.animal_key
-        GROUP BY a.animal_type
-        ORDER BY total_intakes DESC
-        """,
-        (cutoff_date,),
-    ).fetchall()
-
-    stale_groups = [
-        f"{species} (latest={latest}, total={total})"
-        for species, total, recent, latest in rows
-        if recent == 0
-    ]
-
-    if stale_groups:
+    if non_companion_mar:
         return CheckResult(
-            "WARN-2",
-            f"Species freshness in final {FRESHNESS_WINDOW_DAYS}-day window (>= {cutoff_date})",
-            "WARN",
-            "WARN",
-            f"6/8 species active; rare groups with 0 intakes in last {FRESHNESS_WINDOW_DAYS}d: {', '.join(stale_groups)}",
+            "INFO-1",
+            "Missing date_of_birth share by canonical species",
+            "INFO",
+            "INFO",
+            f"Core Cat/Dog <=10% OK; expected non-companion MAR >{MAX_OVERALL_DOB_MISSING_SHARE:.0%}: {', '.join(non_companion_mar)}",
         )
     return CheckResult(
-        "WARN-2",
-        f"Species freshness in final {FRESHNESS_WINDOW_DAYS}-day window (>= {cutoff_date})",
-        "WARN",
+        "INFO-1",
+        "Missing date_of_birth share by canonical species",
+        "INFO",
         "PASS",
-        f"All 8 canonical species recorded intakes on or after {cutoff_date}",
+        "All species below missingness thresholds",
     )
 
 
-def check_warn_3_stay_sequence_anomalies(conn: sqlite3.Connection) -> CheckResult:
-    """WARN 3: Duplicate exit records and multi-stay sequence anomalies."""
+def check_info_2_stay_sequence_anomalies(conn: sqlite3.Connection) -> CheckResult:
+    """
+    INFO 2 (regression-guarded): Duplicate exit records and multi-stay sequence anomalies.
+    Raises WARN only if rates regress above MAX_DUPLICATE_EXIT_SHARE or MAX_SEQUENCE_ANOMALY_SHARE.
+    """
     dup_exits = conn.execute(
         "SELECT COUNT(*) FROM outcomes_clean WHERE days_in_shelter_flag = 'duplicate_exit_for_stay'"
     ).fetchone()[0]
@@ -313,29 +463,38 @@ def check_warn_3_stay_sequence_anomalies(conn: sqlite3.Connection) -> CheckResul
     open_reintakes = conn.execute(
         "SELECT COUNT(*) FROM intakes_clean WHERE stay_sequence_flag = 'reintake_after_open_stay'"
     ).fetchone()[0]
-    view_count = conn.execute("SELECT COUNT(*) FROM stays_clean_view").fetchone()[0]
+    outcome_count = conn.execute("SELECT COUNT(*) FROM outcomes_clean").fetchone()[0]
     intake_count = conn.execute("SELECT COUNT(*) FROM intakes_clean").fetchone()[0]
 
-    if dup_exits > MAX_EXPECTED_DUPLICATE_EXITS or overlaps > 0 or open_reintakes > 0:
+    dup_share = dup_exits / outcome_count if outcome_count else 0.0
+    seq_share = (overlaps + open_reintakes) / intake_count if intake_count else 0.0
+
+    detail = (
+        f"duplicate_exit_for_stay={dup_exits} ({dup_share:.2%}), "
+        f"overlap_with_prior_stay={overlaps}, reintake_after_open_stay={open_reintakes} ({seq_share:.2%})"
+    )
+    if dup_share > MAX_DUPLICATE_EXIT_SHARE or seq_share > MAX_SEQUENCE_ANOMALY_SHARE:
         return CheckResult(
-            "WARN-3",
+            "INFO-2",
             "Stay sequence anomalies and secondary exit records",
             "WARN",
             "WARN",
-            f"duplicate_exit_for_stay={dup_exits} (excluded from stays_clean_view={view_count}/{intake_count}), "
-            f"overlap_with_prior_stay={overlaps}, reintake_after_open_stay={open_reintakes}",
+            "Regression above threshold: " + detail,
         )
     return CheckResult(
-        "WARN-3",
+        "INFO-2",
         "Stay sequence anomalies and secondary exit records",
-        "WARN",
-        "PASS",
-        "0 duplicate exits or sequence overlaps",
+        "INFO",
+        "INFO",
+        "Within historical baseline (excluded from stays_clean_view): " + detail,
     )
 
 
-def check_warn_4_clinical_cross_field_conflicts(conn: sqlite3.Connection) -> CheckResult:
-    """WARN 4: Cross-field clinical conflicts (euthanasia reason & spay/neuter status)."""
+def check_info_3_clinical_cross_field_conflicts(conn: sqlite3.Connection) -> CheckResult:
+    """
+    INFO 3 (regression-guarded): Cross-field clinical conflicts (euthanasia reason & spay/neuter).
+    Raises WARN only if combined share exceeds MAX_CLINICAL_CONFLICT_SHARE (2.0%).
+    """
     non_euth_conflict = conn.execute(
         "SELECT COUNT(*) FROM outcomes_clean WHERE euthanasia_reason_flag = 'conflict_non_euthanasia_status'"
     ).fetchone()[0]
@@ -345,23 +504,30 @@ def check_warn_4_clinical_cross_field_conflicts(conn: sqlite3.Connection) -> Che
     spay_conflict = conn.execute(
         "SELECT COUNT(*) FROM outcomes_clean WHERE spayed_neutered_flag = 'conflict_previously_spayed'"
     ).fetchone()[0]
+    outcome_count = conn.execute("SELECT COUNT(*) FROM outcomes_clean").fetchone()[0]
 
-    if non_euth_conflict > 0 or missing_euth_reason > 0 or spay_conflict > 0:
+    total_conflicts = non_euth_conflict + missing_euth_reason + spay_conflict
+    conflict_share = total_conflicts / outcome_count if outcome_count else 0.0
+
+    detail = (
+        f"conflict_non_euthanasia_status={non_euth_conflict} (nulled), "
+        f"missing_euthanized_no_reason={missing_euth_reason}, "
+        f"conflict_previously_spayed={spay_conflict} (nulled) [total={conflict_share:.2%}]"
+    )
+    if conflict_share > MAX_CLINICAL_CONFLICT_SHARE:
         return CheckResult(
-            "WARN-4",
+            "INFO-3",
             "Cross-field clinical conflicts (euthanasia_reason & spayed_neutered)",
             "WARN",
             "WARN",
-            f"conflict_non_euthanasia_status={non_euth_conflict} (nulled), "
-            f"missing_euthanized_no_reason={missing_euth_reason}, "
-            f"conflict_previously_spayed={spay_conflict} (nulled)",
+            "Regression above threshold: " + detail,
         )
     return CheckResult(
-        "WARN-4",
+        "INFO-3",
         "Cross-field clinical conflicts (euthanasia_reason & spayed_neutered)",
-        "WARN",
-        "PASS",
-        "0 cross-field clinical conflicts detected",
+        "INFO",
+        "INFO",
+        "Within historical baseline: " + detail,
     )
 
 
@@ -370,7 +536,7 @@ def run_validation_suite(
     quiet: bool = False,
     run_time: str | None = None,
 ) -> tuple[int, list[CheckResult]]:
-    """Run all 7 checks on db_path and return (exit_code, results)."""
+    """Run all 8 M5 validation checks on db_path and return (exit_code, results)."""
     resolved_path = Path(db_path) if db_path is not None else get_db_path()
     resolved_run_time = get_run_time(run_time)
     conn = connect(resolved_path, create=False)
@@ -379,22 +545,24 @@ def run_validation_suite(
             check_stop_1_row_parity(conn),
             check_stop_2_zero_invalid_values(conn, run_time=resolved_run_time),
             check_stop_3_fk_and_strict_integrity(conn),
-            check_warn_1_dob_missing_by_species(conn),
-            check_warn_2_freshness_by_species(conn),
-            check_warn_3_stay_sequence_anomalies(conn),
-            check_warn_4_clinical_cross_field_conflicts(conn),
+            check_warn_freshness_from_run_time(conn, run_time=resolved_run_time),
+            check_warn_volume_anomaly(conn, run_time=resolved_run_time),
+            check_info_1_dob_missing_by_species(conn),
+            check_info_2_stay_sequence_anomalies(conn),
+            check_info_3_clinical_cross_field_conflicts(conn),
         ]
     finally:
         conn.close()
 
     n_pass = sum(1 for r in results if r.status == "PASS")
+    n_info = sum(1 for r in results if r.status == "INFO")
     n_warn = sum(1 for r in results if r.status == "WARN")
     n_stop = sum(1 for r in results if r.status == "STOP")
     exit_code = 1 if n_stop > 0 else 0
 
     if not quiet:
         print("=" * 72)
-        print("AUSTIN ANIMAL CENTER -- M3 DATA QUALITY VALIDATION REPORT")
+        print("AUSTIN ANIMAL CENTER -- M5 DATA QUALITY VALIDATION REPORT")
         print("=" * 72)
         print(f"database: {resolved_path} | run_time: {resolved_run_time}")
         for r in results:
@@ -402,18 +570,20 @@ def run_validation_suite(
             print(f"       -> {r.detail}")
         print("-" * 72)
         print(
-            f"SUMMARY: {len(results)} checks run | PASS={n_pass} | WARN={n_warn} | STOP={n_stop} | EXIT_CODE={exit_code}"
+            f"SUMMARY: {len(results)} checks run | PASS={n_pass} | INFO={n_info} | "
+            f"WARN={n_warn} | STOP={n_stop} | EXIT_CODE={exit_code}"
         )
         print("=" * 72)
 
     return exit_code, results
 
 
-def test_stop_checks_on_temp_copy(db_path: Path = DB_PATH) -> bool:
+def test_stop_checks_on_temp_copy(db_path: Path | None = None) -> bool:
     """
     Prove that each STOP check actually triggers and returns exit_code=1
     when its invariant is broken on a temporary copy of the database.
     """
+    resolved_db = Path(db_path) if db_path is not None else get_db_path()
     print("\n" + "=" * 72)
     print("VERIFYING STOP CHECKS ON TEMPORARY DATABASE COPIES (--test-stops)")
     print("=" * 72)
@@ -424,7 +594,7 @@ def test_stop_checks_on_temp_copy(db_path: Path = DB_PATH) -> bool:
 
         # 1. Break STOP-1 (delete 1 row from outcomes_clean)
         db1 = tmp_root / "break_stop1.db"
-        shutil.copy2(db_path, db1)
+        shutil.copy2(resolved_db, db1)
         conn = sqlite3.connect(db1)
         conn.execute(
             "DELETE FROM outcomes_clean WHERE rowid = (SELECT MIN(rowid) FROM outcomes_clean)"
@@ -438,7 +608,7 @@ def test_stop_checks_on_temp_copy(db_path: Path = DB_PATH) -> bool:
 
         # 2. Break STOP-2 (inject a future date_of_birth into animals_clean)
         db2 = tmp_root / "break_stop2.db"
-        shutil.copy2(db_path, db2)
+        shutil.copy2(resolved_db, db2)
         conn = sqlite3.connect(db2)
         conn.execute(
             "UPDATE animals_clean SET date_of_birth = '2099-01-01' WHERE animal_key = 1"
@@ -452,7 +622,7 @@ def test_stop_checks_on_temp_copy(db_path: Path = DB_PATH) -> bool:
 
         # 3. Break STOP-3 (create a non-STRICT table and an orphan FK row)
         db3 = tmp_root / "break_stop3.db"
-        shutil.copy2(db_path, db3)
+        shutil.copy2(resolved_db, db3)
         conn = sqlite3.connect(db3)
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("CREATE TABLE rogue_non_strict (id INTEGER)")
