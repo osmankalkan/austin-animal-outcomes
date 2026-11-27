@@ -115,11 +115,35 @@ Because the longest measured delay is `13.24 h`, setting `OVERLAP_HOURS = 48` ea
 
 ### Missed runs
 
-> *Pending Drill 5 (Nov 27, 2026): Ferdi will disable `\AustinAnimalCenterPipeline` for 12+ hours to miss 2+ consecutive runs, record the `monitor.py` `ALARM`, re-enable the task, and paste the before/after completeness query outputs here.*
+On **2026-11-27 (Friday)**, after the `03:37` (`00:37:03Z`) and `09:37` (`06:37:03Z`) scheduled runs finished cleanly, we disabled `\AustinAnimalCenterPipeline` at `11:30` local time (`08:30Z`) while leaving `\AustinAnimalCenterMonitor` enabled as our dead man's switch. Two consecutive scheduled runs (`15:37` and `21:37` local time) were missed on purpose.
+
+1. **Detected by `monitor.py` before recovery (`2026-11-27T18:58:22Z` automatic scheduled check & `19:00:36Z` manual check, exit code `1`):**
+   ```text
+   [ALARM] check_1_last_success: last full success 2026-11-27T06:37:03Z is 12.39h before --now (limit=12.0h)
+   [PASS ] check_2_gaps: 18 run(s) in last 7d; max gap=6.22h (limit=12.0h)
+   [ALARM] check_3_completeness: 1 missing day-species slot(s) in [2026-11-20..2026-11-26]: 2026-11-26/Cat
+   [PASS ] check_4_freshness: all core species within 48h of 2026-11-27T19:00:36Z: Cat=44.18h (2026-11-25T22:50:00Z), Dog=26.54h (2026-11-26T16:28:00Z)
+   ```
+   *(Note: `2026-11-26/Cat` had 0 intakes because `2026-11-26` was US Thanksgiving Day and Austin Animal Center's front desk was closed — only 4 emergency Dog intakes arrived that day, matching our M4 holiday finding.)*
+
+2. **Re-enabled `\AustinAnimalCenterPipeline` and ran recovery (`run_id = 48a945f4`, `2026-11-27T19:01:14Z`, exit code `0`):**  
+   `src/ingest.py` automatically read `last_success = 2026-11-27T06:37:03Z` from `pipeline_log.db`, fetched the 48-hour overlap window (`40` intakes + `17` outcomes), and loaded the new `2026-11-27` arrival that came in during the outage (`2026-11-27T17:44:00Z`). All 4 steps succeeded with `WARN=0 | STOP=0`.
+
+3. **Completeness & `monitor.py` before vs. after recovery:**
+
+   | Metric (SQL check on `austin_animals.db` / `monitor.py`) | Before Recovery (`19:00:36Z`) | After Recovery (`19:01:58Z`) |
+   |---|---|---|
+   | `check_1_last_success` | **`ALARM`** (`12.39h > 12.0h`) | **`PASS`** (`0.01h <= 12.0h`) |
+   | `check_2_gaps` | `PASS` (`max gap = 6.22h`) | **`ALARM`** (`worst = 12.40h` between `06:37:03Z` and `19:01:14Z`) |
+   | `MAX(intake_at)` | `2026-11-26T16:28:00Z` | `2026-11-27T17:44:00Z` (`Dog` lag `26.54h -> 1.30h`) |
+   | `2026-11-27` UTC intakes (`Cat` / `Dog`) | `0` / `0` (total `0`) | `0` / `1` (total `1`, +1 new animal `19,259 -> 19,260`) |
+   | `2026-11-24..2026-11-25` (`Cat` / `Dog`) | `26/22`, `19/15` | `26/22`, `19/15` (unchanged, no duplicates) |
+
+   The next scheduled run (`2026-11-28 03:37` local time) continued on its normal 6-hour schedule.
 
 ### Drills
 
-We ran the 5 non-schedule failure drills on `2026-11-23` using temporary copies of the database, log database, lock file, and raw folder so the real database stayed clean:
+We ran Drills 1–4 and 6 on `2026-11-23` using temporary copies of the database, log database, lock file, and raw folder so the real database stayed clean, and ran Drill 5 live on Ferdi's Windows schedule on `2026-11-27`:
 
 | Drill | What we did | Exit Code | What the log / output showed |
 |---|---|---:|---|
@@ -127,7 +151,7 @@ We ran the 5 non-schedule failure drills on `2026-11-23` using temporary copies 
 | **2. A step that fails** | Copied `data/austin_animals.db` (SHA-256 `aa8d15d898924ecd`), put a broken JSON file (`{CORRUPT JSON`) in temp `RAW_DATA_DIR/intakes/`, ran `run_pipeline(skip_ingest=True)` | `1` | `src/load.py` failed on JSON parse and rolled back. Runner exited `1` and did not run `clean.py` or `validate.py`. DB hash stayed **`aa8d15d898924ecd`** (`unchanged=True`). Logged: `('src/load.py', 1, 'STATUS: FAILED (transaction rolled back, nothing from this run was written)')`. |
 | **3. A step that hangs** | Ran `run_pipeline(skip_ingest=True, timeout_override=1)` so `src/load.py` (~1.82s) passed the 1s limit | `124` | Runner caught `subprocess.TimeoutExpired`, killed `src/load.py`, exited **`124`**, and logged `('src/load.py', 124, 'timed out')`. |
 | **4. Two runs at once** | Created `d4.lock` with `acquire_lock()` and started a second `run_pipeline(..., lock_path=d4.lock)` | `75` | Second run printed `[LOCK] Another pipeline run is already in progress (...). Exiting with code 75.`, exited **`75`**, and ran 0 steps (`log_db_created=False`). |
-| **5. Missed runs** | *(Planned for Nov 27, 2026 on Ferdi's computer)* | *Pending* | *Will be filled after pausing and resuming `\AustinAnimalCenterPipeline`.* |
+| **5. Missed runs** | Disabled `\AustinAnimalCenterPipeline` on `2026-11-27` (`11:30–22:01` local time) to skip the `15:37` and `21:37` runs, then re-enabled it | `1` (`monitor`), `0` (recovery) | Scheduled `monitor.py` raised `ALARM` on `check_1_last_success` (`12.36h > 12.0h`). After re-enabling, `run_id=48a945f4` recovered the missed window (`40+17` records, `MAX(intake_at)` updated to `2026-11-27T17:44:00Z`), `check_1_last_success` returned to `PASS`, and `check_2_gaps` logged the `12.40h` gap. |
 | **6. Old file re-loaded** | Loaded a newer file (`20261123T200000Z.json`, `animal_id='A999999'`, `sex='Female'`), then re-loaded an older file (`20261120T100000Z.json`, `sex='Unknown'`) | `0` | Newer row stayed untouched because of `WHERE excluded.retrieved_at > animals.retrieved_at`: `animals=('A999999', 'Female', '2026-11-23T20:00:00Z')`. |
 
 #### `src/monitor.py` Read-Only & Forced-ALARM Tests (4/4 Checks)
